@@ -83,9 +83,23 @@ end
 
 function driver_init(config)
     host.set_make("Ferroamp")
+
+    -- Subscribe to telemetry topics
     host.mqtt_subscribe("extapi/data/ehub")
     host.mqtt_subscribe("extapi/data/eso")
     host.mqtt_subscribe("extapi/data/sso")
+
+    -- Subscribe to control response topic to verify commands are received
+    host.mqtt_subscribe("extapi/result")
+
+    -- Query API version to verify connectivity and external API access
+    local version_cmd = '{"transId":"init","cmd":{"name":"extapiversion"}}'
+    host.mqtt_publish("extapi/control/request", version_cmd)
+    host.log("info", "Ferroamp: sent extapiversion query")
+
+    -- Ensure we start in auto mode (clean state)
+    host.mqtt_publish("extapi/control/request", '{"transId":"init","cmd":{"name":"auto"}}')
+    host.log("info", "Ferroamp: set auto mode on init")
 end
 
 function driver_poll()

@@ -1,18 +1,97 @@
 -- Sungrow SH Hybrid Inverter Driver
 -- Emits: PV, Battery, Meter
--- Register type: INPUT
--- Byte order: Little-Endian for multi-register values
+-- Protocol: Modbus TCP (port 502, unit ID 1)
+-- Reference: https://github.com/mkaiser/Sungrow-SHx-Inverter-Modbus-Home-Assistant
+--
+-- Register conventions:
+--   Input registers (FC 0x04): read-only telemetry
+--   Holding registers (FC 0x03/0x06): read/write configuration & control
+--   Multi-register values: Little-Endian word order (low word first)
+--
+-- Battery sign convention (EMS unified):
+--   positive W = charging (grid → battery)
+--   negative W = discharging (battery → grid)
+--
+-- Control registers:
+--   13049: EMS mode (0=self-consumption, 2=forced, 3=external EMS)
+--   13050: Force cmd (0xAA=charge, 0xBB=discharge, 0xCC=stop)
+--   13051: Force power (0-5000W)
+--   33046: Max charge power (scale 0.01 kW, holding)
+--   33047: Max discharge power (scale 0.01 kW, holding)
+--   13057: Max SoC (scale 0.1%, holding)
+--   13058: Min SoC (scale 0.1%, holding)
 
 PROTOCOL = "modbus"
 
 local sn_read = false
+local init_verified = false
+
+----------------------------------------------------------------------------
+-- Initialization
+----------------------------------------------------------------------------
 
 function driver_init(config)
     host.set_make("Sungrow")
+
+    -- Read and log device info
+    local ok, dev = pcall(host.modbus_read, 4999, 1, "input")
+    if ok and dev then
+        host.log("info", "Device type code: " .. tostring(dev[1]))
+    end
+
+    -- Verify and configure power limits for battery control
+    configure_power_limits()
+
+    -- Read current EMS mode and log it
+    local ok_ems, ems = pcall(host.modbus_read, 13049, 3, "holding")
+    if ok_ems and ems then
+        host.log("info", "EMS state: mode=" .. tostring(ems[1])
+            .. " cmd=0x" .. string.format("%04x", ems[2])
+            .. " power=" .. tostring(ems[3]) .. "W")
+    end
 end
 
+-- Ensure power limits allow full charge/discharge (5kW each)
+-- Some Sungrow units ship with discharge capped at 100W
+function configure_power_limits()
+    -- Max charge power: register 33046, scale 0.01 kW
+    local ok_chg, chg = pcall(host.modbus_read, 33046, 1, "holding")
+    if ok_chg and chg then
+        local chg_kw = chg[1] * 0.01
+        host.log("info", "Max charge power: " .. string.format("%.2f", chg_kw) .. " kW")
+        if chg[1] < 500 then
+            host.log("info", "Setting max charge power to 5 kW")
+            pcall(host.modbus_write, 33046, 500)
+        end
+    end
+
+    -- Max discharge power: register 33047, scale 0.01 kW
+    local ok_dis, dis = pcall(host.modbus_read, 33047, 1, "holding")
+    if ok_dis and dis then
+        local dis_kw = dis[1] * 0.01
+        host.log("info", "Max discharge power: " .. string.format("%.2f", dis_kw) .. " kW")
+        if dis[1] < 500 then
+            host.log("info", "Setting max discharge power to 5 kW")
+            pcall(host.modbus_write, 33047, 500)
+        end
+    end
+
+    -- Read SoC limits
+    local ok_soc, soc_lim = pcall(host.modbus_read, 13057, 2, "holding")
+    if ok_soc and soc_lim then
+        host.log("info", "SoC limits: max=" .. string.format("%.1f", soc_lim[1] * 0.1)
+            .. "% min=" .. string.format("%.1f", soc_lim[2] * 0.1) .. "%")
+    end
+
+    init_verified = true
+end
+
+----------------------------------------------------------------------------
+-- Telemetry polling
+----------------------------------------------------------------------------
+
 function driver_poll()
-    -- Read serial number once on first successful poll (Modbus connected by now)
+    -- Read serial number once
     if not sn_read then
         local ok, sn_regs = pcall(host.modbus_read, 4990, 10, "input")
         if ok and sn_regs then
@@ -30,13 +109,11 @@ function driver_poll()
         end
     end
 
-    -- Read status flags to determine battery direction
+    -- Running status: input 13000
+    -- Bit 2 (0x0004) = discharging, Bit 1 (0x0002) = charging
     local ok_status, status_regs = pcall(host.modbus_read, 13000, 1, "input")
     local status = 0
-    if ok_status and status_regs then
-        status = status_regs[1]
-    end
-    -- Lua 5.1 compatible bit check: bit 2 (0x0004) set means discharging
+    if ok_status and status_regs then status = status_regs[1] end
     local is_discharging = (math.floor(status / 4) % 2) == 1
 
     -- PV power: 5016-5017, U32 LE, watts
@@ -46,7 +123,7 @@ function driver_poll()
         pv_w = host.decode_u32_le(pv_regs[1], pv_regs[2])
     end
 
-    -- PV MPPT voltages and currents: 5010-5013
+    -- PV MPPT: 5010-5013
     local ok_mppt, mppt_regs = pcall(host.modbus_read, 5010, 4, "input")
     local mppt1_v, mppt1_a, mppt2_v, mppt2_a = 0, 0, 0, 0
     if ok_mppt and mppt_regs then
@@ -56,7 +133,7 @@ function driver_poll()
         mppt2_a = mppt_regs[4] * 0.1
     end
 
-    -- PV generation energy: 13002-13003, U32 LE × 0.1 kWh
+    -- PV lifetime energy: 13002-13003, U32 LE × 0.1 kWh
     local ok_pvgen, pvgen_regs = pcall(host.modbus_read, 13002, 2, "input")
     local pv_gen_wh = 0
     if ok_pvgen and pvgen_regs then
@@ -77,16 +154,15 @@ function driver_poll()
         heatsink_c = host.decode_i16(temp_regs[1]) * 0.1
     end
 
-    -- Frequency: 5241, U16 × 0.01 Hz
+    -- Grid frequency: 5241, U16 × 0.01 Hz
     local ok_hz, hz_regs = pcall(host.modbus_read, 5241, 1, "input")
     local hz = 0
     if ok_hz and hz_regs then
         hz = hz_regs[1] * 0.01
     end
 
-    -- Emit PV telemetry (W always negative for generation)
     host.emit("pv", {
-        w           = -pv_w,
+        w           = -pv_w,  -- negative = generation (EMS convention)
         mppt1_v     = mppt1_v,
         mppt1_a     = mppt1_a,
         mppt2_v     = mppt2_v,
@@ -96,17 +172,18 @@ function driver_poll()
         temp_c      = heatsink_c,
     })
 
-    -- Battery registers: 13019-13022
+    -- Battery: 13019-13022 (voltage, current, power, SoC)
     local ok_bat, bat_regs = pcall(host.modbus_read, 13019, 4, "input")
     local bat_v, bat_a, bat_w, bat_soc = 0, 0, 0, 0
     if ok_bat and bat_regs then
         bat_v   = bat_regs[1] * 0.1
         bat_a   = bat_regs[2] * 0.1
         bat_w   = bat_regs[3]
-        bat_soc = bat_regs[4] * 0.1 / 100  -- percent to fraction
+        bat_soc = bat_regs[4] * 0.1 / 100  -- 0-1 fraction
     end
 
-    -- Negate battery W if discharging
+    -- Apply sign: Sungrow reports power as unsigned, direction from status register
+    -- EMS convention: positive = charging, negative = discharging
     if is_discharging then
         bat_w = -bat_w
     end
@@ -125,7 +202,6 @@ function driver_poll()
         bat_discharge_wh = host.decode_u32_le(bdis_regs[1], bdis_regs[2]) * 0.1 * 1000
     end
 
-    -- Emit Battery telemetry
     host.emit("battery", {
         w            = bat_w,
         v            = bat_v,
@@ -135,14 +211,14 @@ function driver_poll()
         discharge_wh = bat_discharge_wh,
     })
 
-    -- Meter power: 5600-5601, I32 LE, watts
+    -- Grid meter power: 5600-5601, I32 LE, watts (positive=import, negative=export)
     local ok_mw, mw_regs = pcall(host.modbus_read, 5600, 2, "input")
     local meter_w = 0
     if ok_mw and mw_regs then
         meter_w = host.decode_i32_le(mw_regs[1], mw_regs[2])
     end
 
-    -- Per-phase meter power: 5602-5607, I32 LE each pair
+    -- Per-phase power: 5602-5607, I32 LE pairs
     local ok_mp, mp_regs = pcall(host.modbus_read, 5602, 6, "input")
     local l1_w, l2_w, l3_w = 0, 0, 0
     if ok_mp and mp_regs then
@@ -151,7 +227,7 @@ function driver_poll()
         l3_w = host.decode_i32_le(mp_regs[5], mp_regs[6])
     end
 
-    -- Per-phase voltage: 5740-5742, U16 × 0.1 each
+    -- Per-phase voltage: 5740-5742, U16 × 0.1 V
     local ok_mv, mv_regs = pcall(host.modbus_read, 5740, 3, "input")
     local l1_v, l2_v, l3_v = 0, 0, 0
     if ok_mv and mv_regs then
@@ -160,7 +236,7 @@ function driver_poll()
         l3_v = mv_regs[3] * 0.1
     end
 
-    -- Per-phase current: 5743-5745, U16 × 0.01 each
+    -- Per-phase current: 5743-5745, U16 × 0.01 A
     local ok_ma, ma_regs = pcall(host.modbus_read, 5743, 3, "input")
     local l1_a, l2_a, l3_a = 0, 0, 0
     if ok_ma and ma_regs then
@@ -183,7 +259,6 @@ function driver_poll()
         export_wh = host.decode_u32_le(exp_regs[1], exp_regs[2]) * 0.1 * 1000
     end
 
-    -- Emit Meter telemetry
     host.emit("meter", {
         w         = meter_w,
         l1_w      = l1_w,
@@ -203,49 +278,79 @@ function driver_poll()
     return 5000
 end
 
--- Control command handler for Sungrow battery
--- Reference: https://github.com/mkaiser/Sungrow-SHx-Inverter-Modbus-Home-Assistant
--- Holding registers (address = register - 1):
---   13049 (reg 13050): EMS mode: 0=self-consumption, 2=forced/compulsory, 3=external EMS
---   13050 (reg 13051): Force charge/discharge cmd: 0xAA=charge, 0xBB=discharge, 0xCC=stop
---   13051 (reg 13052): Force charge/discharge power: 0-5000 W
+----------------------------------------------------------------------------
+-- Battery control
+----------------------------------------------------------------------------
+
+-- Battery control command handler
 -- EMS convention: positive power_w = charge, negative = discharge
+-- Verified: charge 200W and discharge 200W both tested and confirmed
 function driver_command(action, power_w, cmd)
     if action == "init" then
         return true
     elseif action == "battery" then
-        if power_w > 0 then
-            -- Force charge
-            host.modbus_write(13051, math.floor(math.min(power_w, 5000)))  -- power limit
-            host.modbus_write(13050, 0xAA)                                 -- force charge cmd
-            host.modbus_write(13049, 2)                                    -- forced mode
-        elseif power_w < 0 then
-            -- Force discharge
-            host.modbus_write(13051, math.floor(math.min(math.abs(power_w), 5000)))  -- power limit
-            host.modbus_write(13050, 0xBB)                                             -- force discharge cmd
-            host.modbus_write(13049, 2)                                                -- forced mode
-        else
-            -- Stop forced mode, return to self-consumption
-            host.modbus_write(13050, 0xCC)  -- stop
-            host.modbus_write(13049, 0)     -- self-consumption mode
-        end
-        return true
+        return set_battery_power(power_w)
     elseif action == "curtail" then
-        -- Limit export power
-        host.modbus_write(13073, math.floor(math.abs(power_w)))
-        return true
+        return set_export_limit(math.abs(power_w))
     elseif action == "curtail_disable" or action == "deinit" then
-        host.modbus_write(13050, 0xCC)  -- stop forced
-        host.modbus_write(13049, 0)     -- self-consumption
-        return true
+        return set_self_consumption()
     end
     return false
 end
 
-function driver_default_mode()
+-- Set battery to a specific charge/discharge power
+-- power_w > 0: charge at power_w watts
+-- power_w < 0: discharge at |power_w| watts
+-- power_w = 0: return to self-consumption
+function set_battery_power(power_w)
+    if power_w > 0 then
+        local watts = math.floor(math.min(power_w, 5000))
+        host.modbus_write(13051, watts)   -- set power limit
+        host.modbus_write(13050, 0xAA)    -- force charge command
+        host.modbus_write(13049, 2)       -- forced mode
+        host.log("debug", "Sungrow: force charge " .. tostring(watts) .. "W")
+    elseif power_w < 0 then
+        local watts = math.floor(math.min(math.abs(power_w), 5000))
+        host.modbus_write(13051, watts)   -- set power limit
+        host.modbus_write(13050, 0xBB)    -- force discharge command
+        host.modbus_write(13049, 2)       -- forced mode
+        host.log("debug", "Sungrow: force discharge " .. tostring(watts) .. "W")
+    else
+        return set_self_consumption()
+    end
+
+    -- Verify the command was accepted
+    local ok, ems = pcall(host.modbus_read, 13049, 3, "holding")
+    if ok and ems then
+        if ems[1] ~= 2 then
+            host.log("warn", "Sungrow: EMS mode not set to forced (got " .. tostring(ems[1]) .. ")")
+            return false
+        end
+    end
+    return true
+end
+
+-- Return to self-consumption mode (safe default)
+function set_self_consumption()
     host.modbus_write(13050, 0xCC)  -- stop forced charge/discharge
     host.modbus_write(13049, 0)     -- self-consumption mode
+    host.log("debug", "Sungrow: self-consumption mode")
+    return true
+end
+
+-- Set export power limit
+function set_export_limit(watts)
+    host.modbus_write(13073, math.floor(watts))
+    host.log("debug", "Sungrow: export limit " .. tostring(watts) .. "W")
+    return true
+end
+
+-- Watchdog fallback: always revert to self-consumption
+function driver_default_mode()
+    host.log("info", "Sungrow: watchdog → reverting to self-consumption")
+    set_self_consumption()
 end
 
 function driver_cleanup()
+    set_self_consumption()
 end
