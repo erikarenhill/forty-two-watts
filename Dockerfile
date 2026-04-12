@@ -1,14 +1,24 @@
 # Multi-stage build for home-ems
+# Uses musl for fully static binary — runs on any Linux without glibc dependency
 FROM rust:latest AS builder
+RUN rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+RUN apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-RUN cargo build --release
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      cargo build --release --target aarch64-unknown-linux-musl; \
+      cp target/aarch64-unknown-linux-musl/release/home-ems /build/home-ems; \
+    else \
+      cargo build --release --target x86_64-unknown-linux-musl; \
+      cp target/x86_64-unknown-linux-musl/release/home-ems /build/home-ems; \
+    fi
 
-# Runtime — static binary, minimal image
-FROM debian:bookworm-slim
+# Runtime — alpine (tiny, musl-compatible)
+FROM alpine:latest
 WORKDIR /app
-COPY --from=builder /build/target/release/home-ems /app/home-ems
+COPY --from=builder /build/home-ems /app/home-ems
 COPY drivers/ /app/drivers/
 COPY web/ /app/web/
 VOLUME /app/data
