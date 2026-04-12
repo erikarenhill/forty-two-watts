@@ -106,6 +106,10 @@ fn handle_status(
     let pv_w: f64 = pvs.iter().map(|p| p.smoothed_w).sum();
     let bat_w: f64 = bats.iter().map(|b| b.smoothed_w).sum();
 
+    // Load = grid + PV generation + battery discharge
+    // grid_w positive=import, pv_w negative=generation, bat_w negative=discharge
+    let load_w: f64 = grid_w - pv_w - bat_w;
+
     // Weighted average SoC by capacity
     let total_cap: f64 = bats.iter()
         .filter_map(|b| capacities.get(&b.driver).copied())
@@ -163,6 +167,7 @@ fn handle_status(
         "grid_w": grid_w,
         "pv_w": pv_w,
         "bat_w": bat_w,
+        "load_w": load_w,
         "bat_soc": avg_soc,
         "grid_target_w": control.grid_target_w,
         "drivers": drivers,
