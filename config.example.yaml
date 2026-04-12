@@ -26,8 +26,8 @@ drivers:
     lua: drivers/sungrow.lua
     battery_capacity_wh: 9600
     modbus:
-      host: 192.168.1.40
-      port: 5021
+      host: 192.168.1.10
+      port: 502
       unit_id: 1
 
 api:

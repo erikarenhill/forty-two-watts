@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>home-ems</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>home-ems</h1>
+    <div class="header-right">
+      <span id="version" class="version">v0.1.0</span>
+      <span id="conn-status" class="conn-status connected" title="Connected">&#9679;</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- Summary Cards -->
+    <section class="summary-cards">
+      <div class="card summary-card" id="card-grid">
+        <div class="card-label">Grid</div>
+        <div class="card-value" id="grid-w">-- W</div>
+        <div class="card-sub" id="grid-dir">--</div>
+      </div>
+      <div class="card summary-card" id="card-pv">
+        <div class="card-label">PV</div>
+        <div class="card-value" id="pv-w">-- W</div>
+        <div class="card-sub">generation</div>
+      </div>
+      <div class="card summary-card" id="card-bat">
+        <div class="card-label">Battery</div>
+        <div class="card-value" id="bat-w">-- W</div>
+        <div class="card-sub" id="bat-dir">--</div>
+      </div>
+      <div class="card summary-card" id="card-soc">
+        <div class="card-label">SoC</div>
+        <div class="card-value" id="bat-soc">-- %</div>
+        <div class="soc-bar"><div class="soc-fill" id="soc-fill"></div></div>
+      </div>
+    </section>
+
+    <!-- Controls -->
+    <section class="controls">
+      <div class="card">
+        <div class="card-label">Mode</div>
+        <div class="mode-buttons" id="mode-buttons">
+          <button data-mode="idle">Idle</button>
+          <button data-mode="self_consumption">Self Consumption</button>
+          <button data-mode="charge">Charge</button>
+          <button data-mode="priority">Priority</button>
+          <button data-mode="weighted">Weighted</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">Grid Target</div>
+        <div class="slider-group">
+          <input type="range" id="grid-target-slider" min="-5000" max="5000" step="10" value="0">
+          <div class="slider-labels">
+            <span>-5000 W</span>
+            <span id="grid-target-value" class="slider-current">0 W</span>
+            <span>5000 W</span>
+          </div>
+          <button id="grid-target-send" class="btn-send">Set Target</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Power Chart -->
+    <section id="chart-section">
+      <h2>Power (last 5 min)</h2>
+      <div class="chart-container">
+        <canvas id="power-chart" width="800" height="250"></canvas>
+      </div>
+      <div class="chart-legend" id="chart-legend">
+        <span class="legend-item"><span class="legend-color" style="background:#ef4444"></span> Grid</span>
+        <span class="legend-item"><span class="legend-color" style="background:#22c55e"></span> PV</span>
+        <span class="legend-item"><span class="legend-color" style="background:#3b82f6"></span> Battery</span>
+      </div>
+    </section>
+
+    <!-- Drivers -->
+    <section id="drivers-section">
+      <h2>Drivers</h2>
+      <div class="drivers-grid" id="drivers-grid"></div>
+    </section>
+
+    <!-- Dispatch -->
+    <section id="dispatch-section">
+      <h2>Dispatch</h2>
+      <div class="dispatch-list" id="dispatch-list"></div>
+    </section>
+  </main>
+
+  <footer>
+    <span id="refresh-indicator" class="refresh-dot" title="Auto-refresh active">&#9679;</span>
+    <span id="last-update">Last update: --</span>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -71,9 +71,16 @@ fn main() {
         telemetry::TelemetryStore::new(config.site.smoothing_alpha)
     ));
 
+    let site_meter_driver = config.drivers.iter()
+        .find(|d| d.is_site_meter)
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| config.drivers[0].name.clone());
+    info!("site meter: {}", site_meter_driver);
+
     let mut control_state = control::ControlState::new(
         config.site.grid_target_w,
         config.site.grid_tolerance_w,
+        site_meter_driver,
     );
     if let Some(mode_str) = state_store.load_config("mode") {
         if let Ok(mode) = serde_json::from_str::<control::Mode>(&format!("\"{}\"", mode_str)) {

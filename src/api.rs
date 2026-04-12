@@ -1,5 +1,7 @@
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::path::Path;
 use tracing::{info, error};
 
 use crate::telemetry::{TelemetryStore, DerType};
@@ -36,6 +38,7 @@ pub fn start(
                     ("POST", "/api/mode") => handle_set_mode(&control, &mut request),
                     ("POST", "/api/target") => handle_set_target(&control, &mut request),
                     ("GET", "/api/drivers") => handle_drivers(&store),
+                    ("GET", path) => serve_static(path),
                     _ => json_response(404, &serde_json::json!({"error": "not found"})),
                 };
 
@@ -51,8 +54,11 @@ fn json_response(status: u16, body: &serde_json::Value) -> tiny_http::Response<s
     let body_str = serde_json::to_string(body).unwrap_or_default();
     let data = std::io::Cursor::new(body_str.into_bytes());
     let status_code = tiny_http::StatusCode(status);
-    let header = tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap();
-    tiny_http::Response::new(status_code, vec![header], data, None, None)
+    let headers = vec![
+        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+        tiny_http::Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap(),
+    ];
+    tiny_http::Response::new(status_code, headers, data, None, None)
 }
 
 fn read_body(request: &mut tiny_http::Request) -> String {
@@ -88,11 +94,15 @@ fn handle_status(
     let control = control.lock().unwrap();
 
     // Aggregate readings
-    let meters = store.readings_by_type(&DerType::Meter);
+    // Grid: only from the site meter driver (not summed — they measure the same point)
+    let grid_w: f64 = store.get(&control.site_meter_driver, &DerType::Meter)
+        .map(|m| m.smoothed_w)
+        .unwrap_or(0.0);
+
+    // PV and battery: sum across all drivers (each system has its own)
     let pvs = store.readings_by_type(&DerType::Pv);
     let bats = store.readings_by_type(&DerType::Battery);
 
-    let grid_w: f64 = meters.iter().map(|m| m.smoothed_w).sum();
     let pv_w: f64 = pvs.iter().map(|p| p.smoothed_w).sum();
     let bat_w: f64 = bats.iter().map(|b| b.smoothed_w).sum();
 
@@ -244,4 +254,61 @@ fn handle_drivers(store: &Arc<Mutex<TelemetryStore>>) -> tiny_http::Response<std
     }).collect();
 
     json_response(200, &serde_json::json!(drivers))
+}
+
+fn serve_static(url_path: &str) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    let web_dir = Path::new("web");
+
+    // Map "/" to "/index.html"
+    let file_path = if url_path == "/" {
+        web_dir.join("index.html")
+    } else {
+        // Strip leading slash and resolve relative to web/
+        let relative = url_path.trim_start_matches('/');
+        let candidate = web_dir.join(relative);
+
+        // Prevent path traversal
+        match candidate.canonicalize() {
+            Ok(abs) => {
+                let web_abs = match web_dir.canonicalize() {
+                    Ok(a) => a,
+                    Err(_) => return json_response(404, &serde_json::json!({"error": "not found"})),
+                };
+                if !abs.starts_with(&web_abs) {
+                    return json_response(403, &serde_json::json!({"error": "forbidden"}));
+                }
+                abs
+            }
+            Err(_) => return json_response(404, &serde_json::json!({"error": "not found"})),
+        }
+    };
+
+    match std::fs::read(&file_path) {
+        Ok(contents) => {
+            let content_type = guess_content_type(&file_path);
+            let data = std::io::Cursor::new(contents);
+            let header = tiny_http::Header::from_bytes("Content-Type", content_type).unwrap();
+            tiny_http::Response::new(
+                tiny_http::StatusCode(200),
+                vec![header],
+                data,
+                None,
+                None,
+            )
+        }
+        Err(_) => json_response(404, &serde_json::json!({"error": "not found"})),
+    }
+}
+
+fn guess_content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("json") => "application/json",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    }
 }

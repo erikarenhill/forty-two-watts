@@ -38,17 +38,19 @@ pub struct ControlState {
     pub mode: Mode,
     pub grid_target_w: f64,
     pub grid_tolerance_w: f64,
+    pub site_meter_driver: String,
     pub priority_order: Vec<String>,
     pub weights: HashMap<String, f64>,
     pub last_targets: Vec<DispatchTarget>,
 }
 
 impl ControlState {
-    pub fn new(grid_target_w: f64, grid_tolerance_w: f64) -> Self {
+    pub fn new(grid_target_w: f64, grid_tolerance_w: f64, site_meter_driver: String) -> Self {
         Self {
             mode: Mode::SelfConsumption,
             grid_target_w,
             grid_tolerance_w,
+            site_meter_driver,
             priority_order: Vec::new(),
             weights: HashMap::new(),
             last_targets: Vec::new(),
@@ -84,9 +86,10 @@ pub fn compute_dispatch(
         _ => {}
     }
 
-    // Read site meter (smoothed)
-    let meters = store.readings_by_type(&DerType::Meter);
-    let grid_w: f64 = meters.iter().map(|m| m.smoothed_w).sum();
+    // Read site meter (only the designated site meter driver, not all meters)
+    let grid_w: f64 = store.get(&state.site_meter_driver, &DerType::Meter)
+        .map(|m| m.smoothed_w)
+        .unwrap_or(0.0);
 
     // Read batteries
     let batteries: Vec<BatteryInfo> = driver_capacities.iter()
