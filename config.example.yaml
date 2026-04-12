@@ -1,0 +1,45 @@
+site:
+  name: "Home"
+  control_interval_s: 5
+  grid_target_w: 0              # 0 = self-consumption
+  grid_tolerance_w: 50          # deadband: don't adjust if within +/- W
+  watchdog_timeout_s: 60        # revert to autonomous if driver stalls
+  smoothing_alpha: 0.3          # EMA alpha (0-1, lower = smoother)
+
+fuse:
+  max_amps: 16
+  phases: 3
+  voltage: 230
+
+drivers:
+  - name: ferroamp
+    lua: drivers/ferroamp.lua
+    is_site_meter: true          # this driver's meter is the grid connection point
+    battery_capacity_wh: 15200
+    mqtt:
+      host: 192.168.1.153
+      port: 1883
+      username: extapi
+      password: ferroampExtApi
+
+  - name: sungrow
+    lua: drivers/sungrow.lua
+    battery_capacity_wh: 9600
+    modbus:
+      host: 192.168.1.40
+      port: 5021
+      unit_id: 1
+
+api:
+  port: 8080
+
+homeassistant:
+  enabled: true
+  broker: 192.168.1.1            # HA Mosquitto broker
+  port: 1883
+  username: homeems
+  password: homeems
+  publish_interval_s: 5
+
+state:
+  path: state.redb
