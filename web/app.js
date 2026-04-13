@@ -120,30 +120,31 @@
     });
 
     // Grid target — only update slider if user is not actively dragging
-    if (document.activeElement !== gridTargetSlider) {
+    if (gridTargetSlider && document.activeElement !== gridTargetSlider) {
       gridTargetSlider.value = data.grid_target_w;
       gridTargetValue.textContent = formatW(data.grid_target_w);
     }
-    if (document.activeElement !== peakLimitSlider && data.peak_limit_w != null) {
+    if (peakLimitSlider && document.activeElement !== peakLimitSlider && data.peak_limit_w != null) {
       peakLimitSlider.value = data.peak_limit_w;
       peakLimitValue.textContent = formatW(data.peak_limit_w);
     }
-    if (document.activeElement !== evSlider && data.ev_charging_w != null) {
+    if (evSlider && document.activeElement !== evSlider && data.ev_charging_w != null) {
       evSlider.value = data.ev_charging_w;
       evValue.textContent = formatW(data.ev_charging_w);
     }
 
-    // Fuse — current power throughput vs limit
-    // Use max of (|grid|, total PV generation, total battery discharge)
-    var totalDischarge = 0;
-    if (data.bat_w < 0) totalDischarge = Math.abs(data.bat_w);
-    var pvGen = Math.abs(data.pv_w);
-    var throughput = Math.max(Math.abs(data.grid_w), pvGen + totalDischarge);
-    var fusePct = Math.min(100, (throughput / FUSE_MAX_W) * 100);
-    var amps = throughput / 230 / 3;
-    fuseUse.textContent = amps.toFixed(1) + " A";
-    fuseFill.style.width = fusePct + "%";
-    fuseFill.className = "fuse-fill" + (fusePct > 85 ? " crit" : fusePct > 65 ? " warn" : "");
+    // Fuse gauge (if present)
+    if (fuseUse && fuseFill) {
+      var totalDischarge = 0;
+      if (data.bat_w < 0) totalDischarge = Math.abs(data.bat_w);
+      var pvGen = Math.abs(data.pv_w);
+      var throughput = Math.max(Math.abs(data.grid_w), pvGen + totalDischarge);
+      var fusePct = Math.min(100, (throughput / FUSE_MAX_W) * 100);
+      var amps = throughput / 230 / 3;
+      fuseUse.textContent = amps.toFixed(1) + " A";
+      fuseFill.style.width = fusePct + "%";
+      fuseFill.className = "fuse-fill" + (fusePct > 85 ? " crit" : fusePct > 65 ? " warn" : "");
+    }
 
     // Drivers
     renderDrivers(data.drivers || {});
@@ -343,9 +344,12 @@
       })
       .then(function (data) {
         setConnected(true);
-        render(data);
+        // Isolate render errors from connection state
+        try { render(data); }
+        catch (e) { console.error("render error:", e); }
       })
-      .catch(function () {
+      .catch(function (e) {
+        console.warn("status fetch failed:", e);
         setConnected(false);
       });
   }
