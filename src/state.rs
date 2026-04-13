@@ -1,6 +1,21 @@
 use redb::{Database, ReadableDatabase, TableDefinition, ReadableTable};
 use tracing::{info, warn, error};
 
+/// Group entries into time buckets of `bucket_ms` and average each bucket.
+/// Returns (bucket_start_ms, averaged_json) pairs.
+fn bucket_by_time(entries: &[(u64, String)], bucket_ms: u64) -> Vec<(u64, String)> {
+    let mut buckets: std::collections::BTreeMap<u64, Vec<(u64, String)>> = std::collections::BTreeMap::new();
+    for (ts, json) in entries {
+        let bucket = (*ts / bucket_ms) * bucket_ms;
+        buckets.entry(bucket).or_default().push((*ts, json.clone()));
+    }
+    buckets.into_iter()
+        .filter_map(|(bucket_ts, chunk)| {
+            average_json_bucket(&chunk).map(|(_, json)| (bucket_ts, json))
+        })
+        .collect()
+}
+
 /// Average numeric fields in a bucket of JSON snapshots. Returns the average
 /// as a new JSON string with the middle timestamp.
 fn average_json_bucket(chunk: &[(u64, String)]) -> Option<(u64, String)> {
@@ -73,10 +88,23 @@ fn replace_with_averages(prefix: &str, obj: &mut serde_json::Map<String, serde_j
 const CONFIG_TABLE: TableDefinition<&str, &str> = TableDefinition::new("config");
 const TELEMETRY_TABLE: TableDefinition<&str, &str> = TableDefinition::new("telemetry");
 const EVENTS_TABLE: TableDefinition<u64, &str> = TableDefinition::new("events");
-const HISTORY_TABLE: TableDefinition<u64, &str> = TableDefinition::new("history");
 
-/// How long to keep history (3 days in seconds)
-pub const HISTORY_RETENTION_S: u64 = 3 * 24 * 3600;
+// Tiered history tables
+const HISTORY_HOT: TableDefinition<u64, &str> = TableDefinition::new("history");        // 5s native, 30 days
+const HISTORY_WARM: TableDefinition<u64, &str> = TableDefinition::new("history_warm");  // 15min buckets, 12 months
+const HISTORY_COLD: TableDefinition<u64, &str> = TableDefinition::new("history_cold");  // daily buckets, forever
+
+/// Hot retention: 30 days at 5s resolution
+pub const HOT_RETENTION_S: u64 = 30 * 24 * 3600;
+/// Warm retention: 12 months at 15min resolution
+pub const WARM_RETENTION_S: u64 = 365 * 24 * 3600;
+/// Warm bucket size in ms
+const WARM_BUCKET_MS: u64 = 15 * 60 * 1000;
+/// Cold bucket size in ms (1 day)
+const COLD_BUCKET_MS: u64 = 24 * 3600 * 1000;
+
+/// Legacy alias (used in existing main.rs)
+pub const HISTORY_RETENTION_S: u64 = HOT_RETENTION_S;
 
 /// Persistent state store backed by redb
 pub struct StateStore {
@@ -93,7 +121,9 @@ impl StateStore {
             let _ = txn.open_table(CONFIG_TABLE)?;
             let _ = txn.open_table(TELEMETRY_TABLE)?;
             let _ = txn.open_table(EVENTS_TABLE)?;
-            let _ = txn.open_table(HISTORY_TABLE)?;
+            let _ = txn.open_table(HISTORY_HOT)?;
+            let _ = txn.open_table(HISTORY_WARM)?;
+            let _ = txn.open_table(HISTORY_COLD)?;
         }
         txn.commit()?;
 
@@ -192,13 +222,11 @@ impl StateStore {
         }
     }
 
-    /// Record a telemetry snapshot to history.
-    /// ts_ms: unix timestamp in milliseconds
-    /// json: JSON-encoded snapshot (grid_w, pv_w, bat_w, load_w, bat_soc, drivers...)
+    /// Record a telemetry snapshot to the hot history tier.
     pub fn record_history(&self, ts_ms: u64, json: &str) {
         match self.db.begin_write() {
             Ok(txn) => {
-                match txn.open_table(HISTORY_TABLE) {
+                match txn.open_table(HISTORY_HOT) {
                     Ok(mut table) => {
                         if let Err(e) = table.insert(ts_ms, json) {
                             warn!("history insert: {}", e);
@@ -212,28 +240,30 @@ impl StateStore {
         }
     }
 
-    /// Load history entries in range [since_ms, until_ms], optionally downsampled
-    /// to at most `max_points` entries by bucket averaging.
+    /// Load history entries in range [since_ms, until_ms] from all tiers (hot+warm+cold),
+    /// merged by timestamp, optionally downsampled to at most `max_points` entries.
     pub fn load_history(&self, since_ms: u64, until_ms: u64, max_points: usize) -> Vec<(u64, String)> {
-        let all: Vec<(u64, String)> = match self.db.begin_read() {
-            Ok(txn) => match txn.open_table(HISTORY_TABLE) {
-                Ok(table) => match table.range(since_ms..=until_ms) {
-                    Ok(iter) => iter
-                        .filter_map(|r| r.ok())
-                        .map(|(k, v)| (k.value(), v.value().to_string()))
-                        .collect(),
-                    Err(_) => Vec::new(),
-                },
-                Err(_) => Vec::new(),
-            },
-            Err(_) => Vec::new(),
-        };
+        let mut all: Vec<(u64, String)> = Vec::new();
+        if let Ok(txn) = self.db.begin_read() {
+            for tbl in [HISTORY_COLD, HISTORY_WARM, HISTORY_HOT] {
+                if let Ok(table) = txn.open_table(tbl) {
+                    if let Ok(iter) = table.range(since_ms..=until_ms) {
+                        for r in iter.flatten() {
+                            all.push((r.0.value(), r.1.value().to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        all.sort_by_key(|(k, _)| *k);
+        // Deduplicate overlapping timestamps (prefer hot → warm → cold, last wins)
+        all.dedup_by_key(|(k, _)| *k);
 
         if all.len() <= max_points || max_points == 0 {
             return all;
         }
 
-        // Downsample by bucket averaging of numeric fields in the JSON
+        // Downsample by bucket averaging
         let bucket_size = all.len().div_ceil(max_points);
         let mut result = Vec::with_capacity(max_points);
         for chunk in all.chunks(bucket_size) {
@@ -244,37 +274,96 @@ impl StateStore {
         result
     }
 
-    /// Delete history entries older than `retention_s` seconds
+    /// Tiered retention: aggregate old hot data into warm tier, old warm into cold, prune both.
+    /// Called periodically by the control loop.
     pub fn prune_history(&self, retention_s: u64) {
+        let _ = retention_s; // legacy param, ignored — use constants
+        if let Err(e) = self.do_tiered_maintenance() {
+            warn!("tiered maintenance: {}", e);
+        }
+    }
+
+    fn do_tiered_maintenance(&self) -> Result<(), Box<dyn std::error::Error>> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let cutoff = now_ms.saturating_sub(retention_s * 1000);
+        let hot_cutoff = now_ms.saturating_sub(HOT_RETENTION_S * 1000);
+        let warm_cutoff = now_ms.saturating_sub(WARM_RETENTION_S * 1000);
 
-        match self.db.begin_write() {
-            Ok(txn) => {
-                match txn.open_table(HISTORY_TABLE) {
-                    Ok(mut table) => {
-                        let _ = table.retain(|k, _| k >= cutoff);
-                    }
-                    Err(e) => warn!("prune: {}", e),
+        // 1) Read hot entries older than cutoff
+        let hot_old: Vec<(u64, String)> = {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(HISTORY_HOT)?;
+            table.range(..hot_cutoff)?
+                .filter_map(|r| r.ok())
+                .map(|(k, v)| (k.value(), v.value().to_string()))
+                .collect()
+        };
+
+        if !hot_old.is_empty() {
+            // Aggregate into 15-min buckets, write to warm
+            let warm_buckets = bucket_by_time(&hot_old, WARM_BUCKET_MS);
+            let txn = self.db.begin_write()?;
+            {
+                let mut warm = txn.open_table(HISTORY_WARM)?;
+                for (ts, json) in &warm_buckets {
+                    warm.insert(*ts, json.as_str())?;
                 }
-                let _ = txn.commit();
+                // Delete from hot
+                let mut hot = txn.open_table(HISTORY_HOT)?;
+                hot.retain(|k, _| k >= hot_cutoff)?;
             }
-            Err(e) => warn!("prune txn: {}", e),
+            txn.commit()?;
+            info!("tiered: {} hot samples → {} warm buckets (15min)",
+                hot_old.len(), warm_buckets.len());
         }
+
+        // 2) Read warm entries older than cutoff
+        let warm_old: Vec<(u64, String)> = {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(HISTORY_WARM)?;
+            table.range(..warm_cutoff)?
+                .filter_map(|r| r.ok())
+                .map(|(k, v)| (k.value(), v.value().to_string()))
+                .collect()
+        };
+
+        if !warm_old.is_empty() {
+            // Aggregate into daily buckets, write to cold
+            let cold_buckets = bucket_by_time(&warm_old, COLD_BUCKET_MS);
+            let txn = self.db.begin_write()?;
+            {
+                let mut cold = txn.open_table(HISTORY_COLD)?;
+                for (ts, json) in &cold_buckets {
+                    cold.insert(*ts, json.as_str())?;
+                }
+                // Delete from warm
+                let mut warm = txn.open_table(HISTORY_WARM)?;
+                warm.retain(|k, _| k >= warm_cutoff)?;
+            }
+            txn.commit()?;
+            info!("tiered: {} warm samples → {} cold buckets (1d)",
+                warm_old.len(), cold_buckets.len());
+        }
+
+        Ok(())
     }
 
-    /// Count history entries (for diagnostics)
-    pub fn history_count(&self) -> usize {
-        match self.db.begin_read() {
-            Ok(txn) => match txn.open_table(HISTORY_TABLE) {
-                Ok(table) => table.iter().map(|it| it.count()).unwrap_or(0),
-                Err(_) => 0,
-            },
-            Err(_) => 0,
+    /// Count history entries per tier (for diagnostics)
+    pub fn history_counts(&self) -> (usize, usize, usize) {
+        let mut counts = (0, 0, 0);
+        if let Ok(txn) = self.db.begin_read() {
+            if let Ok(t) = txn.open_table(HISTORY_HOT) { counts.0 = t.iter().map(|it| it.count()).unwrap_or(0); }
+            if let Ok(t) = txn.open_table(HISTORY_WARM) { counts.1 = t.iter().map(|it| it.count()).unwrap_or(0); }
+            if let Ok(t) = txn.open_table(HISTORY_COLD) { counts.2 = t.iter().map(|it| it.count()).unwrap_or(0); }
         }
+        counts
+    }
+
+    pub fn history_count(&self) -> usize {
+        let (h, w, c) = self.history_counts();
+        h + w + c
     }
 
     /// Load recent events (last N)
