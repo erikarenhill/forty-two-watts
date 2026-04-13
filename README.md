@@ -44,11 +44,15 @@ When your grid power is within 42W of the target, the system logs `Don't Panic` 
 - **PI Controller** with anti-windup — because proportional-only control is for mostly harmless systems
 - **1D Kalman Filter** per signal — auto-adapts to noise. Like the Babel Fish, but for watts
 - **Lua Driver System** — same drivers that run on the Sourceful Zap gateway. Drop in a `.lua` file, get a new device
-- **5 Dispatch Modes**: idle, self_consumption, charge, priority, weighted
+- **6 Dispatch Modes**: idle, self_consumption, peak_shaving, charge, priority, weighted
 - **Fuse Guard** — respects your breaker limits, because tripping a fuse is the grid equivalent of destroying Earth to build a hyperspace bypass
 - **Slew Rate Limiter** — smooth power ramps, no step changes
 - **Home Assistant MQTT** — autodiscovery, sensor publishing, mode control via commands
-- **Web Dashboard** — real-time chart with per-battery target vs actual
+- **Web Dashboard** with **Settings UI** — real-time chart, plus a 6-tab settings modal that edits all config live
+- **Hot Reload** — change *anything* (control tuning, drivers, HA, price, weather) without restarting. Edit the yaml, the file watcher picks it up. Or use the UI — same path
+- **Dynamic Drivers** — add/remove devices via the Settings UI. Threads spin up/down on the fly
+- **Tiered History** — 30 days at 5s, 12 months at 15min, forever at 1d. Auto-aggregated
+- **Energy as Primary** — Wh integrated and persisted; W is derived for control
 - **Crash Recovery** — redb state persistence, resumes where it left off
 
 ## Quick Start
@@ -69,6 +73,8 @@ open http://localhost:8080
 ```
 
 ## Configuration
+
+Two ways to configure: **the Settings UI** (preferred) or **edit `config.yaml` directly**. Both are equivalent — the yaml is canonical and human-readable, the UI just edits it. Either way, changes hot-apply without a restart. See [docs/configuration.md](docs/configuration.md) for the full reference.
 
 ```yaml
 site:
@@ -101,7 +107,36 @@ drivers:
       host: 192.168.1.10
       port: 502
       unit_id: 1
+
+# Optional sections — all hot-reloadable
+price:
+  provider: elprisetjustnu      # or entsoe (needs api_key) or none
+  zone: SE3                     # SE1-SE4
+  grid_tariff_ore_kwh: 50
+  vat_percent: 25
+
+weather:
+  provider: met_no              # or openweather or none
+  latitude: 59.3293
+  longitude: 18.0686
+
+batteries:                      # per-battery overrides (optional)
+  ferroamp:
+    weight: 2.0                 # for weighted mode
+    soc_min: 0.1                # override BMS floor
 ```
+
+### Hot Reload
+
+Both `config.yaml` and the Settings UI write to the same file. A file watcher picks up external edits within 500ms. The runtime diffs new vs current and applies per-subsystem:
+
+| Change | Effect |
+|--------|--------|
+| `site.grid_target_w`, `slew_rate_w`, `min_dispatch_interval_s` | Live-update PI controller |
+| `drivers[]` add/remove/change | Spawn/stop/restart driver threads |
+| `price`, `weather`, `batteries` | Pick up next cycle |
+| `fuse` | Live-update fuse guard limit |
+| `homeassistant`, `api.port` | Restart required (MQTT / socket bind) |
 
 ## Dispatch Modes
 
@@ -109,6 +144,7 @@ drivers:
 |------|-------------|
 | `idle` | Don't Panic. Both systems run autonomously. |
 | `self_consumption` | Target 0W grid. The Answer is always 42W away. |
+| `peak_shaving` | Cap grid import at `peak_limit_w`. Charge from any export. |
 | `charge` | Force charge. For when electricity is cheap and life is good. |
 | `priority` | One battery does the work. Like Zaphod's two heads. |
 | `weighted` | Custom split. Not all batteries are created equal. |
@@ -117,11 +153,23 @@ drivers:
 
 ```bash
 curl http://localhost:8080/api/status           # The Guide
+curl http://localhost:8080/api/config           # Full current config (UI source)
+curl -X POST http://localhost:8080/api/config \
+  -H 'Content-Type: application/json' \
+  -d @new-config.json                           # Replace config + hot-apply + save yaml
 curl -X POST http://localhost:8080/api/mode \
   -d '{"mode":"self_consumption"}'              # Set mode
 curl -X POST http://localhost:8080/api/target \
   -d '{"grid_target_w": 0}'                    # The Question
 ```
+
+## Testing
+
+```bash
+cargo test --release        # Full inline test suite (104+ tests)
+```
+
+Tests cover config validation/roundtrip, energy integration, Kalman/health tracking, control dispatch (all 6 modes + fuse guard + slew rate), driver registry diff logic, atomic save + reload, and API config endpoints.
 
 ## Sign Convention
 

@@ -43,3 +43,24 @@ homeassistant:
 
 state:
   path: state.redb
+
+# Spot price (optional). elprisetjustnu.se is free, Sweden-only.
+# ENTSO-E covers all EU but needs a free api_key.
+price:
+  provider: elprisetjustnu       # or "entsoe" or "none"
+  zone: SE3                      # SE1, SE2, SE3, SE4
+  grid_tariff_ore_kwh: 0
+  vat_percent: 25
+
+# Weather forecast (optional). met.no is free, no key needed.
+weather:
+  provider: met_no               # or "openweather" or "none"
+  latitude: 59.3293              # default: Stockholm
+  longitude: 18.0686
+
+# Per-battery overrides (optional). Keys must match drivers[].name.
+# Leave blank to use BMS defaults.
+batteries: {}
+#  ferroamp:
+#    soc_min: 0.10
+#    weight: 2.0

@@ -1,20 +1,25 @@
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, error};
 
 use crate::telemetry::{TelemetryStore, DerType};
 use crate::control::{ControlState, Mode};
+use crate::config::Config;
+use crate::driver_registry::DriverRegistry;
 
 /// Start the REST API server on a separate thread
 pub fn start(
     port: u16,
     store: Arc<Mutex<TelemetryStore>>,
     control: Arc<Mutex<ControlState>>,
-    driver_capacities: HashMap<String, f64>,
+    driver_capacities: Arc<RwLock<HashMap<String, f64>>>,
     state_store: Arc<crate::state::StateStore>,
     energy: Arc<Mutex<crate::energy::EnergyAccumulator>>,
+    current_config: Arc<RwLock<Config>>,
+    registry: DriverRegistry,
+    config_path: PathBuf,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("api".to_string())
@@ -43,6 +48,8 @@ pub fn start(
                     ("POST", "/api/peak_limit") => handle_set_peak_limit(&control, &mut request),
                     ("POST", "/api/ev_charging") => handle_set_ev_charging(&control, &mut request),
                     ("GET", "/api/drivers") => handle_drivers(&store),
+                    ("GET", "/api/config") => handle_get_config(&current_config),
+                    ("POST", "/api/config") => handle_post_config(&current_config, &registry, &control, &config_path, &mut request),
                     ("GET", p) if p.starts_with("/api/history") => handle_history(&state_store, p),
                     ("GET", path) => serve_static(path),
                     _ => json_response(404, &serde_json::json!({"error": "not found"})),
@@ -94,9 +101,11 @@ fn handle_health(store: &Arc<Mutex<TelemetryStore>>) -> tiny_http::Response<std:
 fn handle_status(
     store: &Arc<Mutex<TelemetryStore>>,
     control: &Arc<Mutex<ControlState>>,
-    capacities: &HashMap<String, f64>,
+    capacities: &Arc<RwLock<HashMap<String, f64>>>,
     energy: &Arc<Mutex<crate::energy::EnergyAccumulator>>,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    let capacities = capacities.read().unwrap().clone();
+    let capacities = &capacities;
     let mut store = store.lock().unwrap();
     let control = control.lock().unwrap();
 
@@ -436,5 +445,204 @@ fn guess_content_type(path: &Path) -> &'static str {
         Some("svg") => "image/svg+xml",
         Some("ico") => "image/x-icon",
         _ => "application/octet-stream",
+    }
+}
+
+/// GET /api/config — return current effective config
+fn handle_get_config(
+    current_config: &Arc<RwLock<Config>>,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    let cfg = current_config.read().unwrap();
+    json_response(200, &serde_json::to_value(&*cfg).unwrap_or(serde_json::Value::Null))
+}
+
+/// Apply a new config: validate, save atomically, hot-reload subsystems, swap current.
+/// Pure-ish — testable without HTTP. Returns Ok on success, Err with a user-facing message on failure.
+pub fn apply_config_update(
+    body: &str,
+    current_config: &Arc<RwLock<Config>>,
+    registry: &DriverRegistry,
+    control: &Arc<Mutex<ControlState>>,
+    config_path: &PathBuf,
+) -> Result<(), (u16, String)> {
+    let new_config: Config = serde_json::from_str(body)
+        .map_err(|e| (400, format!("invalid config: {}", e)))?;
+
+    crate::config_reload::save_atomic(config_path, &new_config)
+        .map_err(|e| (500, format!("save failed: {}", e)))?;
+
+    let old = current_config.read().unwrap().clone();
+
+    {
+        let mut ctrl = control.lock().unwrap();
+        ctrl.set_grid_target(new_config.site.grid_target_w);
+        ctrl.grid_tolerance_w = new_config.site.grid_tolerance_w;
+        ctrl.slew_rate_w = new_config.site.slew_rate_w;
+        ctrl.min_dispatch_interval_s = new_config.site.min_dispatch_interval_s;
+    }
+
+    registry.reload(&new_config.drivers);
+
+    *current_config.write().unwrap() = new_config;
+
+    info!("config updated via API (was {} drivers, now {} drivers)",
+        old.drivers.len(),
+        current_config.read().unwrap().drivers.len());
+    Ok(())
+}
+
+/// POST /api/config — replace config, write to yaml atomically, hot-reload subsystems
+fn handle_post_config(
+    current_config: &Arc<RwLock<Config>>,
+    registry: &DriverRegistry,
+    control: &Arc<Mutex<ControlState>>,
+    config_path: &PathBuf,
+    request: &mut tiny_http::Request,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    let body = read_body(request);
+    match apply_config_update(&body, current_config, registry, control, config_path) {
+        Ok(()) => json_response(200, &serde_json::json!({"status": "ok"})),
+        Err((code, msg)) => json_response(code, &serde_json::json!({"error": msg})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::*;
+    use crate::telemetry::TelemetryStore;
+    use std::sync::atomic::AtomicBool;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<RwLock<Config>>,
+        Arc<Mutex<ControlState>>,
+        DriverRegistry,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+
+        let cfg = Config {
+            site: SiteConfig {
+                name: "Test".into(), control_interval_s: 5,
+                grid_target_w: 0.0, grid_tolerance_w: 50.0,
+                watchdog_timeout_s: 60, smoothing_alpha: 0.3,
+                gain: 0.5, slew_rate_w: 500.0, min_dispatch_interval_s: 5,
+            },
+            fuse: FuseConfig { max_amps: 16.0, phases: 3, voltage: 230.0 },
+            drivers: vec![DriverConfig {
+                name: "a".into(), lua: "drivers/a.lua".into(),
+                is_site_meter: true, battery_capacity_wh: 10000.0,
+                mqtt: Some(MqttConnectionConfig {
+                    host: "1.1.1.1".into(), port: 1883,
+                    username: None, password: None,
+                }),
+                modbus: None,
+            }],
+            api: ApiConfig { port: 8080 },
+            homeassistant: None, state: None, price: None, weather: None,
+            batteries: std::collections::HashMap::new(),
+        };
+        crate::config_reload::save_atomic(&config_path, &cfg).unwrap();
+
+        let current = Arc::new(RwLock::new(cfg));
+        let control = Arc::new(Mutex::new(ControlState::new(0.0, 50.0, "a".into())));
+        let store = Arc::new(Mutex::new(TelemetryStore::new(0.3)));
+        let running = Arc::new(AtomicBool::new(true));
+        let registry = DriverRegistry::new(store, 60, dir.path().to_path_buf(), running);
+
+        (dir, config_path, current, control, registry)
+    }
+
+    #[test]
+    fn apply_config_update_persists_and_applies_control_changes() {
+        let (_dir, config_path, current, control, registry) = fixture();
+
+        let mut new_cfg = current.read().unwrap().clone();
+        new_cfg.site.grid_target_w = -750.0;
+        new_cfg.site.grid_tolerance_w = 100.0;
+        let body = serde_json::to_string(&new_cfg).unwrap();
+
+        apply_config_update(&body, &current, &registry, &control, &config_path).expect("apply");
+
+        // Control state updated
+        let ctrl = control.lock().unwrap();
+        assert_eq!(ctrl.grid_target_w, -750.0);
+        assert_eq!(ctrl.grid_tolerance_w, 100.0);
+        assert_eq!(ctrl.pid_controller.setpoint, -750.0);
+        drop(ctrl);
+
+        // current_config swapped
+        assert_eq!(current.read().unwrap().site.grid_target_w, -750.0);
+
+        // yaml persisted to disk
+        let from_disk = Config::load(&config_path).unwrap();
+        assert_eq!(from_disk.site.grid_target_w, -750.0);
+
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn apply_config_update_rejects_invalid_json() {
+        let (_dir, config_path, current, control, registry) = fixture();
+        let original = current.read().unwrap().clone();
+
+        let result = apply_config_update("{not json", &current, &registry, &control, &config_path);
+        let (code, msg) = result.expect_err("must reject");
+        assert_eq!(code, 400);
+        assert!(msg.contains("invalid config"), "msg: {}", msg);
+
+        // current_config untouched
+        assert_eq!(current.read().unwrap().site.name, original.site.name);
+
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn apply_config_update_rejects_missing_required_fields() {
+        let (_dir, config_path, current, control, registry) = fixture();
+
+        // Missing fuse field — should fail to deserialize into Config
+        let bad = r#"{"site":{"name":"x"},"drivers":[],"api":{"port":8080}}"#;
+        let result = apply_config_update(bad, &current, &registry, &control, &config_path);
+        let (code, _) = result.expect_err("must reject");
+        assert_eq!(code, 400);
+
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn get_config_returns_full_serializable_config() {
+        let (_dir, _config_path, current, _control, registry) = fixture();
+
+        let resp = handle_get_config(&current);
+        // Inspect the response status — handle_get_config wraps via json_response(200,..)
+        assert_eq!(resp.status_code(), tiny_http::StatusCode(200));
+
+        // Also verify Config serializes losslessly
+        let json = serde_json::to_value(&*current.read().unwrap()).unwrap();
+        assert!(json.get("site").is_some());
+        assert!(json.get("fuse").is_some());
+        assert!(json.get("drivers").is_some());
+        assert!(json.get("api").is_some());
+        // Default-None sections still appear (as null)
+        assert!(json.get("homeassistant").is_some());
+        assert!(json.get("price").is_some());
+
+        registry.shutdown_all();
+    }
+
+    #[test]
+    fn apply_config_update_full_roundtrip_via_get_payload() {
+        // Simulates the UI: GET → edit → POST. The body returned by GET must be
+        // accepted by POST without modification.
+        let (_dir, config_path, current, control, registry) = fixture();
+
+        let payload = serde_json::to_string(&*current.read().unwrap()).unwrap();
+        apply_config_update(&payload, &current, &registry, &control, &config_path)
+            .expect("GET → POST roundtrip must succeed");
+
+        registry.shutdown_all();
     }
 }

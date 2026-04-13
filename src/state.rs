@@ -111,6 +111,14 @@ pub struct StateStore {
     db: Database,
 }
 
+/// History tier (test-only helper)
+#[cfg(test)]
+pub(crate) enum HistoryTier {
+    Hot,
+    Warm,
+    Cold,
+}
+
 impl StateStore {
     pub fn open(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let db = Database::create(path)?;
@@ -199,12 +207,14 @@ impl StateStore {
         }
     }
 
-    /// Record an event (mode change, error, recovery)
+    /// Record an event (mode change, error, recovery).
+    /// Keyed by milliseconds since epoch — multiple events in the same second
+    /// won't collide and overwrite each other.
     pub fn record_event(&self, event: &str) {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
+            .as_millis() as u64;
 
         match self.db.begin_write() {
             Ok(txn) => {
@@ -366,6 +376,22 @@ impl StateStore {
         h + w + c
     }
 
+    /// Test-only: write directly into a tier with a chosen timestamp
+    #[cfg(test)]
+    pub(crate) fn record_history_at(&self, tier: HistoryTier, ts_ms: u64, json: &str) {
+        let table = match tier {
+            HistoryTier::Hot => HISTORY_HOT,
+            HistoryTier::Warm => HISTORY_WARM,
+            HistoryTier::Cold => HISTORY_COLD,
+        };
+        if let Ok(txn) = self.db.begin_write() {
+            if let Ok(mut t) = txn.open_table(table) {
+                let _ = t.insert(ts_ms, json);
+            }
+            let _ = txn.commit();
+        }
+    }
+
     /// Load recent events (last N)
     pub fn recent_events(&self, limit: usize) -> Vec<(u64, String)> {
         let mut events = Vec::new();
@@ -391,5 +417,188 @@ impl StateStore {
         }
 
         events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_store() -> (tempfile::TempDir, StateStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = StateStore::open(path.to_str().unwrap()).expect("open");
+        (dir, store)
+    }
+
+    #[test]
+    fn config_save_load_roundtrip() {
+        let (_dir, store) = fresh_store();
+        store.save_config("mode", "self_consumption");
+        store.save_config("grid_target_w", "-500");
+        assert_eq!(store.load_config("mode").as_deref(), Some("self_consumption"));
+        assert_eq!(store.load_config("grid_target_w").as_deref(), Some("-500"));
+        assert_eq!(store.load_config("nonexistent"), None);
+    }
+
+    #[test]
+    fn config_overwrites_previous_value() {
+        let (_dir, store) = fresh_store();
+        store.save_config("k", "v1");
+        store.save_config("k", "v2");
+        assert_eq!(store.load_config("k").as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn config_persists_across_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let path_str = path.to_str().unwrap();
+        {
+            let s = StateStore::open(path_str).unwrap();
+            s.save_config("greeting", "hello");
+        }
+        let s = StateStore::open(path_str).unwrap();
+        assert_eq!(s.load_config("greeting").as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn telemetry_save_load() {
+        let (_dir, store) = fresh_store();
+        store.save_telemetry("ferroamp:battery", r#"{"w":1500}"#);
+        assert_eq!(store.load_telemetry("ferroamp:battery").as_deref(), Some(r#"{"w":1500}"#));
+    }
+
+    #[test]
+    fn record_history_and_count() {
+        let (_dir, store) = fresh_store();
+        assert_eq!(store.history_count(), 0);
+        store.record_history(1000, r#"{"grid_w":100}"#);
+        store.record_history(2000, r#"{"grid_w":200}"#);
+        store.record_history(3000, r#"{"grid_w":300}"#);
+        assert_eq!(store.history_count(), 3);
+        let (hot, warm, cold) = store.history_counts();
+        assert_eq!((hot, warm, cold), (3, 0, 0));
+    }
+
+    #[test]
+    fn load_history_in_range() {
+        let (_dir, store) = fresh_store();
+        for i in 0..10u64 {
+            store.record_history(i * 1000, &format!(r#"{{"grid_w":{}}}"#, i * 100));
+        }
+        let entries = store.load_history(2000, 5000, 100);
+        assert_eq!(entries.len(), 4); // 2000, 3000, 4000, 5000
+        assert_eq!(entries[0].0, 2000);
+        assert_eq!(entries.last().unwrap().0, 5000);
+    }
+
+    #[test]
+    fn load_history_downsamples_when_over_limit() {
+        let (_dir, store) = fresh_store();
+        for i in 0..1000u64 {
+            store.record_history(i, &format!(r#"{{"grid_w":{}}}"#, i));
+        }
+        let entries = store.load_history(0, 1000, 50);
+        assert!(entries.len() <= 50, "downsampled to {}, expected ≤50", entries.len());
+        assert!(!entries.is_empty());
+    }
+
+    #[test]
+    fn load_history_merges_tiers_dedup_overlapping() {
+        let (_dir, store) = fresh_store();
+        // Same timestamp in both hot and warm — should dedupe
+        store.record_history_at(HistoryTier::Hot, 5000, r#"{"hot":1}"#);
+        store.record_history_at(HistoryTier::Warm, 5000, r#"{"warm":1}"#);
+        store.record_history_at(HistoryTier::Hot, 6000, r#"{"hot":2}"#);
+
+        let entries = store.load_history(0, 10000, 100);
+        // 5000 should appear once (deduped), plus 6000 → 2 unique timestamps
+        let timestamps: Vec<u64> = entries.iter().map(|(t, _)| *t).collect();
+        assert_eq!(timestamps, vec![5000, 6000]);
+    }
+
+    #[test]
+    fn load_history_merges_three_tiers_in_order() {
+        let (_dir, store) = fresh_store();
+        store.record_history_at(HistoryTier::Cold, 1000, r#"{"x":1}"#);
+        store.record_history_at(HistoryTier::Warm, 2000, r#"{"x":2}"#);
+        store.record_history_at(HistoryTier::Hot, 3000, r#"{"x":3}"#);
+        let entries = store.load_history(0, 100000, 100);
+        assert_eq!(entries.len(), 3);
+        // Sorted by timestamp ascending
+        assert_eq!(entries[0].0, 1000);
+        assert_eq!(entries[1].0, 2000);
+        assert_eq!(entries[2].0, 3000);
+    }
+
+    #[test]
+    fn record_event_and_recent_events() {
+        let (_dir, store) = fresh_store();
+        store.record_event("startup");
+        store.record_event("driver_added: x");
+        store.record_event("driver_removed: x");
+
+        let events = store.recent_events(10);
+        assert!(events.len() >= 3, "expected ≥3 events, got {}", events.len());
+        // Most recent timestamps last
+        let messages: Vec<&str> = events.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("startup")));
+        assert!(messages.iter().any(|m| m.contains("driver_added")));
+    }
+
+    #[test]
+    fn recent_events_limit() {
+        let (_dir, store) = fresh_store();
+        // ms precision — no need to sleep
+        for i in 0..10 {
+            store.record_event(&format!("event {}", i));
+        }
+        let events = store.recent_events(3);
+        assert!(events.len() <= 3);
+        assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn average_json_bucket_averages_numeric_fields() {
+        let chunk = vec![
+            (1000u64, r#"{"grid_w":100,"pv_w":200}"#.to_string()),
+            (2000u64, r#"{"grid_w":200,"pv_w":300}"#.to_string()),
+            (3000u64, r#"{"grid_w":300,"pv_w":400}"#.to_string()),
+        ];
+        let (mid_ts, avg_json) = average_json_bucket(&chunk).unwrap();
+        assert_eq!(mid_ts, 2000);
+        let parsed: serde_json::Value = serde_json::from_str(&avg_json).unwrap();
+        assert_eq!(parsed["grid_w"].as_f64().unwrap(), 200.0);
+        assert_eq!(parsed["pv_w"].as_f64().unwrap(), 300.0);
+    }
+
+    #[test]
+    fn average_json_bucket_averages_nested_fields() {
+        let chunk = vec![
+            (1000u64, r#"{"drivers":{"a":{"meter_w":100}}}"#.to_string()),
+            (2000u64, r#"{"drivers":{"a":{"meter_w":300}}}"#.to_string()),
+        ];
+        let (_, avg_json) = average_json_bucket(&chunk).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&avg_json).unwrap();
+        assert_eq!(parsed["drivers"]["a"]["meter_w"].as_f64().unwrap(), 200.0);
+    }
+
+    #[test]
+    fn bucket_by_time_groups_into_15min_buckets() {
+        // Three samples in same 15-min bucket, two in next
+        let entries = vec![
+            (0u64, r#"{"x":10}"#.to_string()),
+            (60_000u64, r#"{"x":20}"#.to_string()),
+            (120_000u64, r#"{"x":30}"#.to_string()),
+            (15 * 60_000u64, r#"{"x":100}"#.to_string()),
+            (15 * 60_000u64 + 60_000, r#"{"x":200}"#.to_string()),
+        ];
+        let buckets = bucket_by_time(&entries, 15 * 60 * 1000);
+        assert_eq!(buckets.len(), 2);
+        let v0: serde_json::Value = serde_json::from_str(&buckets[0].1).unwrap();
+        assert_eq!(v0["x"].as_f64().unwrap(), 20.0); // (10+20+30)/3
+        let v1: serde_json::Value = serde_json::from_str(&buckets[1].1).unwrap();
+        assert_eq!(v1["x"].as_f64().unwrap(), 150.0); // (100+200)/2
     }
 }

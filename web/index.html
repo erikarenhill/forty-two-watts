@@ -10,10 +10,36 @@
   <header>
     <h1>forty-two-watts 🐬</h1>
     <div class="header-right">
+      <button id="settings-btn" class="settings-btn" title="Settings">⚙</button>
       <span id="version" class="version">v0.1.0</span>
       <span id="conn-status" class="conn-status connected" title="Connected">&#9679;</span>
     </div>
   </header>
+
+  <!-- Settings Modal -->
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>Settings</h2>
+        <button id="settings-close" class="modal-close">×</button>
+      </div>
+      <div class="modal-tabs" id="settings-tabs">
+        <button data-tab="control" class="active">Control</button>
+        <button data-tab="devices">Devices</button>
+        <button data-tab="price">Price</button>
+        <button data-tab="weather">Weather</button>
+        <button data-tab="batteries">Batteries</button>
+        <button data-tab="ha">Home Assistant</button>
+      </div>
+      <div class="modal-body" id="settings-body">
+        <!-- Filled by JS -->
+      </div>
+      <div class="modal-footer">
+        <span id="settings-status" class="settings-status"></span>
+        <button id="settings-save" class="btn-send">Save</button>
+      </div>
+    </div>
+  </div>
 
   <main>
     <!-- Summary Cards — compact 5-in-a-row -->
@@ -161,5 +187,6 @@
   </footer>
 
   <script src="/app.js"></script>
+  <script src="/settings.js"></script>
 </body>
 </html>

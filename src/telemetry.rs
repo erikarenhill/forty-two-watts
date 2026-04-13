@@ -248,3 +248,154 @@ impl TelemetryStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn der_type_roundtrip() {
+        for s in &["meter", "pv", "battery"] {
+            let dt = DerType::from_str(s).unwrap();
+            assert_eq!(dt.as_str(), *s);
+        }
+        assert!(DerType::from_str("nonsense").is_none());
+    }
+
+    #[test]
+    fn kalman_initializes_to_first_measurement() {
+        let mut k = KalmanFilter1D::new(100.0, 50.0);
+        let out = k.update(1234.0);
+        assert_eq!(out, 1234.0);
+        assert_eq!(k.estimate, 1234.0);
+    }
+
+    #[test]
+    fn kalman_smooths_step_change() {
+        // After init, a sudden jump should be partially absorbed
+        let mut k = KalmanFilter1D::new(100.0, 50.0);
+        k.update(1000.0);
+        let out = k.update(2000.0);
+        assert!(out > 1000.0 && out < 2000.0,
+            "expected smoothed value between 1000 and 2000, got {}", out);
+    }
+
+    #[test]
+    fn kalman_converges_to_stable_signal() {
+        // Feed constant signal, estimate should converge to it
+        let mut k = KalmanFilter1D::new(100.0, 50.0);
+        for _ in 0..50 {
+            k.update(500.0);
+        }
+        assert!((k.estimate - 500.0).abs() < 1.0,
+            "expected ≈500, got {}", k.estimate);
+    }
+
+    #[test]
+    fn driver_health_records_success() {
+        let mut h = DriverHealth::new("test");
+        assert_eq!(h.status, DriverStatus::Ok);
+        h.record_success();
+        assert_eq!(h.status, DriverStatus::Ok);
+        assert!(h.last_success.is_some());
+        assert_eq!(h.consecutive_errors, 0);
+        assert_eq!(h.tick_count, 1);
+    }
+
+    #[test]
+    fn driver_health_degrades_after_3_errors() {
+        let mut h = DriverHealth::new("test");
+        h.record_error("e1");
+        assert_eq!(h.status, DriverStatus::Ok);
+        h.record_error("e2");
+        assert_eq!(h.status, DriverStatus::Ok);
+        h.record_error("e3");
+        assert_eq!(h.status, DriverStatus::Degraded);
+        assert_eq!(h.consecutive_errors, 3);
+        assert_eq!(h.last_error.as_deref(), Some("e3"));
+    }
+
+    #[test]
+    fn driver_health_recovers_on_success() {
+        let mut h = DriverHealth::new("test");
+        h.record_error("e1");
+        h.record_error("e2");
+        h.record_error("e3");
+        assert_eq!(h.status, DriverStatus::Degraded);
+        h.record_success();
+        assert_eq!(h.status, DriverStatus::Ok);
+        assert_eq!(h.consecutive_errors, 0);
+        assert!(h.last_error.is_none());
+    }
+
+    #[test]
+    fn driver_health_offline_state() {
+        let mut h = DriverHealth::new("test");
+        h.set_offline();
+        assert_eq!(h.status, DriverStatus::Offline);
+        assert!(!h.is_online());
+        h.record_success();
+        assert!(h.is_online());
+    }
+
+    #[test]
+    fn store_update_and_get() {
+        let mut store = TelemetryStore::new(0.3);
+        store.update("ferroamp", &DerType::Meter, serde_json::json!({}), 1500.0, None);
+        let r = store.get("ferroamp", &DerType::Meter).unwrap();
+        assert_eq!(r.raw_w, 1500.0);
+        assert_eq!(r.smoothed_w, 1500.0); // first reading
+    }
+
+    #[test]
+    fn store_keeps_separate_filters_per_driver_and_type() {
+        let mut store = TelemetryStore::new(0.3);
+        store.update("a", &DerType::Battery, serde_json::json!({}), 100.0, Some(0.5));
+        store.update("b", &DerType::Battery, serde_json::json!({}), 200.0, Some(0.7));
+        store.update("a", &DerType::Pv, serde_json::json!({}), 300.0, None);
+
+        assert_eq!(store.get("a", &DerType::Battery).unwrap().raw_w, 100.0);
+        assert_eq!(store.get("b", &DerType::Battery).unwrap().raw_w, 200.0);
+        assert_eq!(store.get("a", &DerType::Pv).unwrap().raw_w, 300.0);
+        assert!(store.get("b", &DerType::Pv).is_none());
+    }
+
+    #[test]
+    fn readings_by_type_aggregates() {
+        let mut store = TelemetryStore::new(0.3);
+        store.update("a", &DerType::Battery, serde_json::json!({}), 100.0, None);
+        store.update("b", &DerType::Battery, serde_json::json!({}), 200.0, None);
+        store.update("a", &DerType::Meter, serde_json::json!({}), 50.0, None);
+
+        let bats = store.readings_by_type(&DerType::Battery);
+        assert_eq!(bats.len(), 2);
+        let total: f64 = bats.iter().map(|b| b.raw_w).sum();
+        assert_eq!(total, 300.0);
+    }
+
+    #[test]
+    fn is_stale_when_unknown() {
+        let store = TelemetryStore::new(0.3);
+        assert!(store.is_stale("nonexistent", &DerType::Meter, 60));
+    }
+
+    #[test]
+    fn is_stale_when_fresh() {
+        let mut store = TelemetryStore::new(0.3);
+        store.update("a", &DerType::Meter, serde_json::json!({}), 0.0, None);
+        assert!(!store.is_stale("a", &DerType::Meter, 60));
+    }
+
+    #[test]
+    fn load_filter_smooths_noisy_signal() {
+        let mut store = TelemetryStore::new(0.3);
+        // Feed wildly varying load values — should converge to mean
+        let values = vec![1000.0, 2000.0, 500.0, 1500.0, 1200.0, 800.0, 1100.0, 1400.0];
+        let mut last = 0.0;
+        for v in values {
+            last = store.update_load(v);
+        }
+        // Should be somewhere in the middle, not at the last input
+        assert!(last > 500.0 && last < 2000.0, "load filter at {}", last);
+    }
+}

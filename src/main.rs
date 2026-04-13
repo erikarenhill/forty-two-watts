@@ -8,24 +8,16 @@ mod api;
 mod ha;
 mod state;
 mod energy;
+mod driver_registry;
+mod config_reload;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tracing::{info, warn, error};
 
-/// Command sent from the control loop to a driver thread
-#[derive(Debug)]
-enum DriverCommand {
-    /// Call driver_command("battery", power_w, cmd_json)
-    Battery { power_w: f64 },
-    /// Call driver_default_mode() (watchdog fallback)
-    DefaultMode,
-    /// Shutdown the driver thread
-    Shutdown,
-}
+use driver_registry::{DriverRegistry, DriverCommand};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -37,26 +29,30 @@ fn main() {
 
     info!("forty-two-watts v{} — The Answer to Grid Balancing", env!("CARGO_PKG_VERSION"));
 
-    let config_path = std::env::args()
+    let config_path_str = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "config.yaml".to_string());
+    let config_path = PathBuf::from(&config_path_str);
 
-    let config = match config::Config::load(Path::new(&config_path)) {
+    // Load config
+    let initial_config = match config::Config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            error!("failed to load config '{}': {}", config_path, e);
+            error!("failed to load config '{}': {}", config_path_str, e);
             std::process::exit(1);
         }
     };
 
-    info!("site: {}", config.site.name);
+    info!("site: {}", initial_config.site.name);
     info!("fuse: {}A / {}ph (max {:.0}W)",
-        config.fuse.max_amps, config.fuse.phases, config.fuse.max_power_w());
+        initial_config.fuse.max_amps, initial_config.fuse.phases, initial_config.fuse.max_power_w());
     info!("control: {}s interval, target {}W, tolerance {}W",
-        config.site.control_interval_s, config.site.grid_target_w, config.site.grid_tolerance_w);
+        initial_config.site.control_interval_s,
+        initial_config.site.grid_target_w,
+        initial_config.site.grid_tolerance_w);
 
     // Open persistent state
-    let state_path = config.state.as_ref()
+    let state_path = initial_config.state.as_ref()
         .map(|s| s.path.clone())
         .unwrap_or_else(|| "state.redb".to_string());
     let state_store = match state::StateStore::open(&state_path) {
@@ -67,48 +63,44 @@ fn main() {
         }
     };
 
-    // Initialize shared state
+    // Telemetry store
     let store = Arc::new(Mutex::new(
-        telemetry::TelemetryStore::new(config.site.smoothing_alpha)
+        telemetry::TelemetryStore::new(initial_config.site.smoothing_alpha)
     ));
 
-    let site_meter_driver = config.drivers.iter()
+    // Site meter (which driver is the grid connection point)
+    let site_meter_driver = initial_config.drivers.iter()
         .find(|d| d.is_site_meter)
         .map(|d| d.name.clone())
-        .unwrap_or_else(|| config.drivers[0].name.clone());
+        .unwrap_or_else(|| initial_config.drivers[0].name.clone());
     info!("site meter: {}", site_meter_driver);
 
+    // Control state
     let mut control_state = control::ControlState::new(
-        config.site.grid_target_w,
-        config.site.grid_tolerance_w,
+        initial_config.site.grid_target_w,
+        initial_config.site.grid_tolerance_w,
         site_meter_driver,
     );
-    control_state.slew_rate_w = config.site.slew_rate_w;
-    control_state.min_dispatch_interval_s = config.site.min_dispatch_interval_s;
-    info!("control: PI(Kp=0.4,Ki=0.05) + Kalman filter + slew={}W + holdoff={}s",
-        control_state.slew_rate_w, control_state.min_dispatch_interval_s);
+    control_state.slew_rate_w = initial_config.site.slew_rate_w;
+    control_state.min_dispatch_interval_s = initial_config.site.min_dispatch_interval_s;
     if let Some(mode_str) = state_store.load_config("mode") {
         if let Ok(mode) = serde_json::from_str::<control::Mode>(&format!("\"{}\"", mode_str)) {
             info!("restored mode: {:?}", mode);
             control_state.mode = mode;
         }
     }
+    info!("control: PI(Kp=0.5,Ki=0.1) + Kalman + slew={}W + holdoff={}s",
+        control_state.slew_rate_w, control_state.min_dispatch_interval_s);
     let control = Arc::new(Mutex::new(control_state));
 
-    let driver_capacities: HashMap<String, f64> = config.drivers.iter()
-        .map(|d| (d.name.clone(), d.battery_capacity_wh))
-        .collect();
-    let driver_names: Vec<String> = config.drivers.iter().map(|d| d.name.clone()).collect();
-
-    // Energy accumulator — restore from state store if present
+    // Energy accumulator
     let energy_state: energy::EnergyState = state_store.load_config("energy")
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     if !energy_state.today_date.is_empty() {
-        info!("restored energy: today={:.2}kWh import, {:.2}kWh PV, {:.2}kWh exported",
-            energy_state.today.import_wh / 1000.0,
+        info!("restored energy: today={:.2}kWh PV, {:.2}kWh load",
             energy_state.today.pv_wh / 1000.0,
-            energy_state.today.export_wh / 1000.0);
+            energy_state.today.load_wh / 1000.0);
     }
     let energy = Arc::new(Mutex::new(energy::EnergyAccumulator::new(energy_state)));
 
@@ -120,111 +112,115 @@ fn main() {
         r.store(false, std::sync::atomic::Ordering::SeqCst);
     }).expect("failed to set ctrl-c handler");
 
+    // Resolve lua directory
+    let lua_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+    // Driver registry — manages driver lifecycle dynamically
+    let registry = DriverRegistry::new(
+        store.clone(),
+        initial_config.site.watchdog_timeout_s,
+        lua_dir,
+        running.clone(),
+    );
+
+    // Spawn initial drivers
+    for dc in &initial_config.drivers {
+        registry.add(dc.clone());
+    }
+
+    // Driver capacities map (used by control loop) — kept as snapshot, refreshed on reload
+    let driver_capacities = Arc::new(RwLock::new(driver_capacities_from(&initial_config.drivers)));
+
+    // Shared current config — single source of truth
+    let current_config = Arc::new(RwLock::new(initial_config.clone()));
+
     // Start REST API
+    let api_port = initial_config.api.port;
     let _api_handle = api::start(
-        config.api.port,
+        api_port,
         store.clone(),
         control.clone(),
         driver_capacities.clone(),
         state_store.clone(),
         energy.clone(),
+        current_config.clone(),
+        registry.clone(),
+        config_path.clone(),
     );
 
     // Start HA MQTT bridge
-    if let Some(ha_config) = config.homeassistant {
+    if let Some(ha_config) = &initial_config.homeassistant {
         if ha_config.enabled {
+            let driver_names: Vec<String> = registry.names();
             let _ha_handle = ha::start(
-                ha_config,
+                ha_config.clone(),
                 store.clone(),
                 control.clone(),
-                driver_names.clone(),
+                driver_names,
             );
         }
     }
 
-    // Resolve lua directory (relative to config file)
-    let config_dir = Path::new(&config_path).parent().unwrap_or(Path::new("."));
-    let lua_dir = config_dir.to_path_buf();
+    // Start config file watcher — hot reload on yaml changes
+    let _watcher_handle = config_reload::start_watcher(
+        config_path.clone(),
+        current_config.clone(),
+        registry.clone(),
+        control.clone(),
+    );
 
-    // Start driver threads
-    let mut cmd_senders: HashMap<String, mpsc::Sender<DriverCommand>> = HashMap::new();
-    let mut driver_handles = Vec::new();
-
-    for driver_config in &config.drivers {
-        let (tx, rx) = mpsc::channel::<DriverCommand>();
-        cmd_senders.insert(driver_config.name.clone(), tx);
-
-        let dc = driver_config.clone();
-        let store_clone = store.clone();
-        let watchdog_s = config.site.watchdog_timeout_s;
-        let lua_dir_clone = lua_dir.clone();
-        let running_clone = running.clone();
-
-        let handle = std::thread::Builder::new()
-            .name(format!("driver-{}", driver_config.name))
-            .spawn(move || {
-                run_driver_thread(dc, store_clone, watchdog_s, lua_dir_clone, rx, running_clone);
-            })
-            .expect("failed to spawn driver thread");
-
-        driver_handles.push((driver_config.name.clone(), handle));
-    }
-
-    info!("home-ems running on http://0.0.0.0:{}", config.api.port);
+    info!("forty-two-watts running on http://0.0.0.0:{}", api_port);
     state_store.record_event("startup");
 
     // Control loop on main thread
-    let control_interval = Duration::from_secs(config.site.control_interval_s);
-    let fuse_max_w = config.fuse.max_power_w();
+    let control_interval = Duration::from_secs(initial_config.site.control_interval_s);
+    let fuse_max_w = initial_config.fuse.max_power_w();
 
     while running.load(std::sync::atomic::Ordering::SeqCst) {
         std::thread::sleep(control_interval);
+
+        // Refresh capacities from current config (in case drivers were added/removed)
+        {
+            let cfg = current_config.read().unwrap();
+            *driver_capacities.write().unwrap() = driver_capacities_from(&cfg.drivers);
+        }
+        let capacities_snap = driver_capacities.read().unwrap().clone();
 
         // Run one control cycle
         let targets = {
             let store_lock = store.lock().unwrap();
             let mut control_lock = control.lock().unwrap();
-            control::compute_dispatch(&store_lock, &mut control_lock, &driver_capacities, fuse_max_w)
+            control::compute_dispatch(&store_lock, &mut control_lock, &capacities_snap, fuse_max_w)
         };
 
-        // Dispatch targets to drivers via channels
+        // Dispatch targets to drivers via registry
         for target in &targets {
-            if let Some(tx) = cmd_senders.get(&target.driver) {
-                let cmd = DriverCommand::Battery { power_w: target.target_w };
-                if let Err(e) = tx.send(cmd) {
-                    warn!("failed to send command to {}: {}", target.driver, e);
-                }
-            }
+            let _ = registry.send(&target.driver, DriverCommand::Battery { power_w: target.target_w });
         }
 
-        // Check watchdog for each driver
+        // Watchdog per driver
+        let watchdog_s = current_config.read().unwrap().site.watchdog_timeout_s;
         {
             let store_lock = store.lock().unwrap();
-            for name in &driver_names {
+            for name in &registry.names() {
                 if let Some(health) = store_lock.driver_health(name) {
-                    if health.status == telemetry::DriverStatus::Offline {
-                        continue; // already handled
-                    }
+                    if health.status == telemetry::DriverStatus::Offline { continue; }
                     if let Some(last) = health.last_success {
-                        if last.elapsed().as_secs() > config.site.watchdog_timeout_s {
+                        if last.elapsed().as_secs() > watchdog_s {
                             warn!("driver '{}' watchdog expired, reverting to default mode", name);
-                            if let Some(tx) = cmd_senders.get(name) {
-                                let _ = tx.send(DriverCommand::DefaultMode);
-                            }
+                            let _ = registry.send(name, DriverCommand::DefaultMode);
                         }
                     }
                 }
             }
         }
 
-        // Persist state
+        // Persist control + energy state
         {
             let control_lock = control.lock().unwrap();
             state_store.save_config("mode", &serde_json::to_string(&control_lock.mode).unwrap_or_default().trim_matches('"'));
             state_store.save_config("grid_target_w", &control_lock.grid_target_w.to_string());
         }
-
-        // Integrate energy + persist
         {
             let store_lock = store.lock().unwrap();
             let ctrl_lock = control.lock().unwrap();
@@ -243,40 +239,31 @@ fn main() {
         }
 
         // Record history snapshot
+        let driver_names = registry.names();
         record_history_snapshot(&store, &control, &driver_names, &state_store, &energy);
 
-        // Periodic pruning (every ~30 cycles = 2.5 min)
+        // Periodic pruning (every ~150s)
         if std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() % 150 < config.site.control_interval_s
+            .as_secs() % 150 < initial_config.site.control_interval_s
         {
             state_store.prune_history(state::HISTORY_RETENTION_S);
         }
     }
 
-    // Shutdown: send shutdown to all drivers
+    // Shutdown
     info!("shutting down drivers...");
-    for (name, tx) in &cmd_senders {
-        let _ = tx.send(DriverCommand::DefaultMode);
-        let _ = tx.send(DriverCommand::Shutdown);
-        info!("sent shutdown to driver '{}'", name);
-    }
-
-    // Wait for driver threads to finish
-    for (name, handle) in driver_handles {
-        if let Err(e) = handle.join() {
-            error!("driver '{}' thread panicked: {:?}", name, e);
-        }
-    }
-
+    registry.shutdown_all();
     state_store.record_event("shutdown");
-    info!("home-ems stopped");
+    info!("forty-two-watts stopped");
 }
 
-/// Record a telemetry snapshot to history database.
-/// Stores BOTH power (W) for instant view AND cumulative energy (Wh) so charts
-/// can derive average power between samples, or display energy directly.
+fn driver_capacities_from(drivers: &[config::DriverConfig]) -> HashMap<String, f64> {
+    drivers.iter().map(|d| (d.name.clone(), d.battery_capacity_wh)).collect()
+}
+
+/// Record a telemetry snapshot to history database
 fn record_history_snapshot(
     store: &Arc<Mutex<telemetry::TelemetryStore>>,
     control: &Arc<Mutex<control::ControlState>>,
@@ -321,13 +308,11 @@ fn record_history_snapshot(
             drivers.insert(name.clone(), serde_json::Value::Object(d));
         }
 
-        // Per-driver dispatch targets
         let mut targets = serde_json::Map::new();
         for t in &ctrl.last_targets {
             targets.insert(t.driver.clone(), serde_json::json!(t.target_w));
         }
 
-        // Cumulative energy (Wh) — authoritative source of truth for aggregation
         let e = energy.lock().unwrap();
         let today = &e.state.today;
         let total = &e.state.total;
@@ -341,7 +326,6 @@ fn record_history_snapshot(
             "bat_soc": avg_soc,
             "drivers": drivers,
             "targets": targets,
-            // Energy snapshots: today and all-time cumulative Wh
             "energy_today": {
                 "import_wh": today.import_wh,
                 "export_wh": today.export_wh,
@@ -362,73 +346,4 @@ fn record_history_snapshot(
     };
 
     state_store.record_history(now_ms, &snapshot.to_string());
-}
-
-/// Run a driver thread: load Lua, init, poll loop, handle commands
-fn run_driver_thread(
-    config: config::DriverConfig,
-    store: Arc<Mutex<telemetry::TelemetryStore>>,
-    watchdog_timeout_s: u64,
-    lua_dir: PathBuf,
-    cmd_rx: mpsc::Receiver<DriverCommand>,
-    running: Arc<std::sync::atomic::AtomicBool>,
-) {
-    info!("driver '{}': starting", config.name);
-
-    // Load driver
-    let mut driver = match lua::driver::Driver::load(&config, store.clone(), watchdog_timeout_s, &lua_dir) {
-        Ok(d) => d,
-        Err(e) => {
-            error!("driver '{}': failed to load: {}", config.name, e);
-            store.lock().unwrap().driver_health_mut(&config.name).record_error(&e);
-            store.lock().unwrap().driver_health_mut(&config.name).set_offline();
-            return;
-        }
-    };
-
-    // Initialize
-    if let Err(e) = driver.init(&config) {
-        error!("driver '{}': init failed: {}", config.name, e);
-        // Continue anyway — some drivers work without init
-    }
-
-    info!("driver '{}': entering poll loop", config.name);
-
-    // Poll loop
-    while running.load(std::sync::atomic::Ordering::SeqCst) {
-        // Check for commands (non-blocking)
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                DriverCommand::Battery { power_w } => {
-                    let cmd_json = r#"{"id":"ems"}"#;
-                    if let Err(e) = driver.command("battery", power_w, cmd_json) {
-                        warn!("driver '{}': command error: {}", config.name, e);
-                    } else {
-                        info!("driver '{}': battery -> {:.0}W", config.name, power_w);
-                    }
-                }
-                DriverCommand::DefaultMode => {
-                    if let Err(e) = driver.default_mode() {
-                        warn!("driver '{}': default_mode error: {}", config.name, e);
-                    }
-                    driver.mark_watchdog_triggered();
-                }
-                DriverCommand::Shutdown => {
-                    info!("driver '{}': shutdown received", config.name);
-                    driver.cleanup();
-                    return;
-                }
-            }
-        }
-
-        // Poll the driver
-        let interval = driver.poll();
-
-        // Sleep for the requested interval
-        std::thread::sleep(interval);
-    }
-
-    // Cleanup on exit
-    driver.default_mode().ok();
-    driver.cleanup();
 }

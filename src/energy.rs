@@ -134,3 +134,171 @@ fn days_to_ymd(days_since_epoch: i64) -> (i32, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m as u32, d as u32)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx(a: f64, b: f64, eps: f64) {
+        assert!((a - b).abs() < eps, "expected {} ≈ {} (eps {})", a, b, eps);
+    }
+
+    #[test]
+    fn integrate_import_one_hour() {
+        // 1000W for 3600s = 1000Wh import
+        let mut c = EnergyCounters::default();
+        c.integrate(1000.0, 0.0, 0.0, 3600.0);
+        approx(c.import_wh, 1000.0, 0.01);
+        approx(c.export_wh, 0.0, 0.01);
+    }
+
+    #[test]
+    fn integrate_export() {
+        // -2000W (export) for 1800s = 1000Wh export
+        let mut c = EnergyCounters::default();
+        c.integrate(-2000.0, 0.0, 0.0, 1800.0);
+        approx(c.export_wh, 1000.0, 0.01);
+        approx(c.import_wh, 0.0, 0.01);
+    }
+
+    #[test]
+    fn integrate_pv_uses_absolute() {
+        let mut c = EnergyCounters::default();
+        c.integrate(0.0, -3000.0, 0.0, 3600.0);
+        approx(c.pv_wh, 3000.0, 0.01);
+        // Same as positive — PV magnitude regardless of sign convention
+        let mut c2 = EnergyCounters::default();
+        c2.integrate(0.0, 3000.0, 0.0, 3600.0);
+        approx(c2.pv_wh, 3000.0, 0.01);
+    }
+
+    #[test]
+    fn integrate_battery_charge_vs_discharge() {
+        let mut c = EnergyCounters::default();
+        c.integrate(0.0, 0.0, 1500.0, 3600.0);    // charging
+        c.integrate(0.0, 0.0, -1000.0, 1800.0);   // discharging 30 min
+        approx(c.bat_charged_wh, 1500.0, 0.01);
+        approx(c.bat_discharged_wh, 500.0, 0.01);
+    }
+
+    #[test]
+    fn integrate_load_balance() {
+        // Grid 500W import, PV 0, battery 0 → load = 500W
+        // 1 hour → 500Wh load
+        let mut c = EnergyCounters::default();
+        c.integrate(500.0, 0.0, 0.0, 3600.0);
+        approx(c.load_wh, 500.0, 0.01);
+
+        // Grid 200W, PV -1500W (gen), battery 800W charging
+        // Load = 200 - (-1500) - 800 = 900W → 900Wh in 1h
+        let mut c2 = EnergyCounters::default();
+        c2.integrate(200.0, -1500.0, 800.0, 3600.0);
+        approx(c2.load_wh, 900.0, 0.01);
+    }
+
+    #[test]
+    fn load_clamped_to_non_negative() {
+        // Energy balance can momentarily go negative due to timing —
+        // load can never be negative in physical reality.
+        let mut c = EnergyCounters::default();
+        c.integrate(-100.0, -1000.0, 500.0, 3600.0);
+        // raw = -100 - (-1000) - 500 = 400 ✓
+        approx(c.load_wh, 400.0, 0.01);
+
+        let mut c2 = EnergyCounters::default();
+        c2.integrate(0.0, -1000.0, -500.0, 3600.0);
+        // raw = 0 - (-1000) - (-500) = 1500 ✓ all positive
+        approx(c2.load_wh, 1500.0, 0.01);
+
+        let mut c3 = EnergyCounters::default();
+        // Construct a clearly-negative case
+        c3.integrate(-2000.0, 1000.0, 500.0, 3600.0);
+        // raw = -2000 - 1000 - 500 = -3500 → clamped to 0
+        approx(c3.load_wh, 0.0, 0.01);
+    }
+
+    #[test]
+    fn state_yaml_roundtrip_with_defaults() {
+        // EnergyState should round-trip through serde, including new fields
+        let mut s = EnergyState::default();
+        s.today.import_wh = 1234.5;
+        s.today.load_wh = 456.7;
+        s.today_date = "2026-04-13".into();
+        s.total.pv_wh = 99999.0;
+
+        let json = serde_json::to_string(&s).unwrap();
+        let back: EnergyState = serde_json::from_str(&json).unwrap();
+        approx(back.today.import_wh, 1234.5, 0.001);
+        approx(back.today.load_wh, 456.7, 0.001);
+        approx(back.total.pv_wh, 99999.0, 0.001);
+        assert_eq!(back.today_date, "2026-04-13");
+    }
+
+    #[test]
+    fn old_state_without_load_wh_deserializes_with_default() {
+        // Older state files (pre-load tracking) must load cleanly with load_wh=0
+        let old_json = r#"{"today":{"import_wh":100,"export_wh":50,"pv_wh":200,"bat_charged_wh":30,"bat_discharged_wh":20},"total":{"import_wh":1000,"export_wh":500,"pv_wh":2000,"bat_charged_wh":300,"bat_discharged_wh":200},"today_date":"2026-04-12"}"#;
+        let parsed: EnergyState = serde_json::from_str(old_json).expect("old format must parse");
+        approx(parsed.today.import_wh, 100.0, 0.01);
+        approx(parsed.today.load_wh, 0.0, 0.01); // missing field defaults
+    }
+
+    #[test]
+    fn state_default_is_empty() {
+        let s = EnergyState::default();
+        assert_eq!(s.today.import_wh, 0.0);
+        assert!(s.today_date.is_empty());
+    }
+
+    #[test]
+    fn accumulator_skips_first_call() {
+        // First call has no last_integrate, so nothing is added
+        let mut acc = EnergyAccumulator::new(EnergyState::default());
+        acc.integrate(1000.0, 0.0, 0.0);
+        assert_eq!(acc.state.today.import_wh, 0.0);
+    }
+
+    #[test]
+    fn accumulator_integrates_on_subsequent_calls() {
+        let mut acc = EnergyAccumulator::new(EnergyState::default());
+        acc.integrate(1000.0, 0.0, 0.0);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        acc.integrate(1000.0, 0.0, 0.0);
+        // ~0.1s of 1000W ≈ 0.0278 Wh
+        assert!(acc.state.today.import_wh > 0.02 && acc.state.today.import_wh < 0.05,
+            "unexpected accumulation: {}", acc.state.today.import_wh);
+    }
+
+    #[test]
+    fn day_rollover_resets_today_keeps_total() {
+        let mut s = EnergyState::default();
+        s.today_date = "1970-01-01".into(); // ancient — definitely not today
+        s.today.import_wh = 5000.0;
+        s.total.import_wh = 50000.0;
+        s.check_day_rollover();
+        assert_eq!(s.today.import_wh, 0.0); // reset
+        assert_eq!(s.total.import_wh, 50000.0); // preserved
+        assert_ne!(s.today_date, "1970-01-01"); // updated
+    }
+
+    #[test]
+    fn day_rollover_no_op_when_same_date() {
+        let today = current_date_string();
+        let mut s = EnergyState::default();
+        s.today_date = today.clone();
+        s.today.import_wh = 100.0;
+        s.check_day_rollover();
+        assert_eq!(s.today.import_wh, 100.0); // preserved
+        assert_eq!(s.today_date, today);
+    }
+
+    #[test]
+    fn ymd_known_dates() {
+        // 2026-04-13 is days_since_epoch where 1970-01-01 is day 0
+        // 2000-01-01 = 10957 days since epoch
+        let (y, m, d) = days_to_ymd(10957);
+        assert_eq!((y, m, d), (2000, 1, 1));
+        let (y, m, d) = days_to_ymd(0);
+        assert_eq!((y, m, d), (1970, 1, 1));
+    }
+}
