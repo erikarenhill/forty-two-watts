@@ -113,6 +113,7 @@ fn main() {
         store.clone(),
         control.clone(),
         driver_capacities.clone(),
+        state_store.clone(),
     );
 
     // Start HA MQTT bridge
@@ -208,6 +209,18 @@ fn main() {
             state_store.save_config("mode", &serde_json::to_string(&control_lock.mode).unwrap_or_default().trim_matches('"'));
             state_store.save_config("grid_target_w", &control_lock.grid_target_w.to_string());
         }
+
+        // Record history snapshot
+        record_history_snapshot(&store, &control, &driver_names, &state_store);
+
+        // Periodic pruning (every ~30 cycles = 2.5 min)
+        if std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() % 150 < config.site.control_interval_s
+        {
+            state_store.prune_history(state::HISTORY_RETENTION_S);
+        }
     }
 
     // Shutdown: send shutdown to all drivers
@@ -227,6 +240,71 @@ fn main() {
 
     state_store.record_event("shutdown");
     info!("home-ems stopped");
+}
+
+/// Record a telemetry snapshot to history database
+fn record_history_snapshot(
+    store: &Arc<Mutex<telemetry::TelemetryStore>>,
+    control: &Arc<Mutex<control::ControlState>>,
+    driver_names: &[String],
+    state_store: &Arc<state::StateStore>,
+) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let snapshot = {
+        let st = store.lock().unwrap();
+        let ctrl = control.lock().unwrap();
+
+        let grid_w = st.get(&ctrl.site_meter_driver, &telemetry::DerType::Meter)
+            .map(|m| m.smoothed_w).unwrap_or(0.0);
+        let pv_w: f64 = st.readings_by_type(&telemetry::DerType::Pv).iter().map(|p| p.smoothed_w).sum();
+        let bat_w: f64 = st.readings_by_type(&telemetry::DerType::Battery).iter().map(|b| b.smoothed_w).sum();
+        let bat_readings = st.readings_by_type(&telemetry::DerType::Battery);
+        let avg_soc: f64 = if !bat_readings.is_empty() {
+            bat_readings.iter().filter_map(|b| b.soc).sum::<f64>() / bat_readings.len() as f64
+        } else { 0.0 };
+        let load_w = grid_w - pv_w - bat_w;
+
+        let mut drivers = serde_json::Map::new();
+        for name in driver_names {
+            let mut d = serde_json::Map::new();
+            if let Some(m) = st.get(name, &telemetry::DerType::Meter) {
+                d.insert("meter_w".into(), serde_json::json!(m.smoothed_w));
+            }
+            if let Some(p) = st.get(name, &telemetry::DerType::Pv) {
+                d.insert("pv_w".into(), serde_json::json!(p.smoothed_w));
+            }
+            if let Some(b) = st.get(name, &telemetry::DerType::Battery) {
+                d.insert("bat_w".into(), serde_json::json!(b.smoothed_w));
+                if let Some(soc) = b.soc {
+                    d.insert("bat_soc".into(), serde_json::json!(soc));
+                }
+            }
+            drivers.insert(name.clone(), serde_json::Value::Object(d));
+        }
+
+        // Per-driver dispatch targets
+        let mut targets = serde_json::Map::new();
+        for t in &ctrl.last_targets {
+            targets.insert(t.driver.clone(), serde_json::json!(t.target_w));
+        }
+
+        serde_json::json!({
+            "ts": now_ms,
+            "grid_w": grid_w,
+            "pv_w": pv_w,
+            "bat_w": bat_w,
+            "load_w": load_w,
+            "bat_soc": avg_soc,
+            "drivers": drivers,
+            "targets": targets,
+        })
+    };
+
+    state_store.record_history(now_ms, &snapshot.to_string());
 }
 
 /// Run a driver thread: load Lua, init, poll loop, handle commands

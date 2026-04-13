@@ -13,6 +13,7 @@ pub fn start(
     store: Arc<Mutex<TelemetryStore>>,
     control: Arc<Mutex<ControlState>>,
     driver_capacities: HashMap<String, f64>,
+    state_store: Arc<crate::state::StateStore>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("api".to_string())
@@ -38,6 +39,7 @@ pub fn start(
                     ("POST", "/api/mode") => handle_set_mode(&control, &mut request),
                     ("POST", "/api/target") => handle_set_target(&control, &mut request),
                     ("GET", "/api/drivers") => handle_drivers(&store),
+                    ("GET", p) if p.starts_with("/api/history") => handle_history(&state_store, p),
                     ("GET", path) => serve_static(path),
                     _ => json_response(404, &serde_json::json!({"error": "not found"})),
                 };
@@ -261,6 +263,69 @@ fn handle_drivers(store: &Arc<Mutex<TelemetryStore>>) -> tiny_http::Response<std
     }).collect();
 
     json_response(200, &serde_json::json!(drivers))
+}
+
+/// Handle GET /api/history?range=5m|1h|24h|3d[&points=N]
+fn handle_history(
+    state_store: &Arc<crate::state::StateStore>,
+    path: &str,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    // Parse query params
+    let query = path.split('?').nth(1).unwrap_or("");
+    let mut range_s: u64 = 300; // default 5 min
+    let mut max_points: usize = 120;
+
+    for param in query.split('&') {
+        let mut parts = param.splitn(2, '=');
+        let key = parts.next().unwrap_or("");
+        let val = parts.next().unwrap_or("");
+        match key {
+            "range" => {
+                range_s = match val {
+                    "5m" => 300,
+                    "15m" => 900,
+                    "1h" => 3600,
+                    "6h" => 21600,
+                    "24h" | "1d" => 86400,
+                    "3d" => 259200,
+                    _ => val.parse().unwrap_or(300),
+                };
+                // Pick sensible point count per range
+                max_points = match val {
+                    "5m" => 60,
+                    "15m" => 90,
+                    "1h" => 120,
+                    "6h" => 144,
+                    "24h" | "1d" => 144,
+                    "3d" => 216,
+                    _ => 120,
+                };
+            }
+            "points" => {
+                max_points = val.parse().unwrap_or(120);
+            }
+            _ => {}
+        }
+    }
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let since_ms = now_ms.saturating_sub(range_s * 1000);
+
+    let entries = state_store.load_history(since_ms, now_ms, max_points);
+
+    // Return as array of objects
+    let items: Vec<serde_json::Value> = entries.into_iter()
+        .filter_map(|(_, json)| serde_json::from_str(&json).ok())
+        .collect();
+
+    json_response(200, &serde_json::json!({
+        "range_s": range_s,
+        "count": items.len(),
+        "items": items,
+    }))
 }
 
 fn serve_static(url_path: &str) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {

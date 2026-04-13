@@ -15,8 +15,8 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
       cp target/x86_64-unknown-linux-musl/release/forty-two-watts /build/forty-two-watts; \
     fi
 
-# Runtime — alpine (tiny, musl-compatible)
-FROM alpine:latest
+# Runtime — debian-slim (small, works with musl static binaries)
+FROM debian:bookworm-slim
 WORKDIR /app
 COPY --from=builder /build/forty-two-watts /app/forty-two-watts
 COPY drivers/ /app/drivers/

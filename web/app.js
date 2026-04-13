@@ -378,7 +378,41 @@
     setTarget(Number(gridTargetSlider.value));
   });
 
+  // ---- History loader ----
+  function loadHistory(range) {
+    var points = CHART_POINTS;
+    return fetch("/api/history?range=" + (range || "5m") + "&points=" + points)
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (data) {
+        if (!data || !data.items) return;
+        // Populate chart history from persisted data
+        chartHistory.grid = [];
+        chartHistory.pv = [];
+        chartHistory.load = [];
+        chartHistory.ferroamp_bat = [];
+        chartHistory.sungrow_bat = [];
+        chartHistory.ferroamp_target = [];
+        chartHistory.sungrow_target = [];
+        data.items.forEach(function (it) {
+          var fd = (it.drivers || {}).ferroamp || {};
+          var sd = (it.drivers || {}).sungrow || {};
+          var ft = (it.targets || {}).ferroamp || 0;
+          var st = (it.targets || {}).sungrow || 0;
+          chartHistory.grid.push(it.grid_w || 0);
+          chartHistory.pv.push(it.pv_w || 0);
+          chartHistory.load.push(it.load_w || 0);
+          chartHistory.ferroamp_bat.push(fd.bat_w || 0);
+          chartHistory.sungrow_bat.push(sd.bat_w || 0);
+          chartHistory.ferroamp_target.push(ft);
+          chartHistory.sungrow_target.push(st);
+        });
+        renderChart();
+      })
+      .catch(function () { /* silent */ });
+  }
+
   // ---- Init ----
+  loadHistory("5m");
   fetchStatus();
   setInterval(fetchStatus, POLL_INTERVAL);
 })();
