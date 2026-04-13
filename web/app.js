@@ -48,6 +48,11 @@
   const evSend = $("ev-send");
   const fuseUse = $("fuse-use");
   const fuseFill = $("fuse-fill");
+  const eImport = $("e-import");
+  const eExport = $("e-export");
+  const ePv = $("e-pv");
+  const eCharged = $("e-charged");
+  const eDischarged = $("e-discharged");
   const lastUpdate = $("last-update");
   const FUSE_MAX_W = 11040; // 16A * 230V * 3ph
 
@@ -62,6 +67,13 @@
 
   function formatSoc(soc) {
     return Math.round(soc * 100) + "%";
+  }
+
+  function formatKwh(wh) {
+    var kwh = (wh || 0) / 1000;
+    if (kwh >= 100) return kwh.toFixed(0) + " kWh";
+    if (kwh >= 10) return kwh.toFixed(1) + " kWh";
+    return kwh.toFixed(2) + " kWh";
   }
 
   function statusClass(status) {
@@ -135,6 +147,16 @@
     if (evSlider && document.activeElement !== evSlider && data.ev_charging_w != null) {
       evSlider.value = data.ev_charging_w;
       evValue.textContent = formatW(data.ev_charging_w);
+    }
+
+    // Energy today
+    if (data.energy && data.energy.today) {
+      var t = data.energy.today;
+      if (eImport) eImport.textContent = formatKwh(t.import_wh);
+      if (eExport) eExport.textContent = formatKwh(t.export_wh);
+      if (ePv) ePv.textContent = formatKwh(t.pv_wh);
+      if (eCharged) eCharged.textContent = formatKwh(t.bat_charged_wh);
+      if (eDischarged) eDischarged.textContent = formatKwh(t.bat_discharged_wh);
     }
 
     // Fuse gauge (if present)

@@ -7,6 +7,7 @@ mod control;
 mod api;
 mod ha;
 mod state;
+mod energy;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -99,6 +100,18 @@ fn main() {
         .collect();
     let driver_names: Vec<String> = config.drivers.iter().map(|d| d.name.clone()).collect();
 
+    // Energy accumulator — restore from state store if present
+    let energy_state: energy::EnergyState = state_store.load_config("energy")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if !energy_state.today_date.is_empty() {
+        info!("restored energy: today={:.2}kWh import, {:.2}kWh PV, {:.2}kWh exported",
+            energy_state.today.import_wh / 1000.0,
+            energy_state.today.pv_wh / 1000.0,
+            energy_state.today.export_wh / 1000.0);
+    }
+    let energy = Arc::new(Mutex::new(energy::EnergyAccumulator::new(energy_state)));
+
     // Graceful shutdown
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let r = running.clone();
@@ -114,6 +127,7 @@ fn main() {
         control.clone(),
         driver_capacities.clone(),
         state_store.clone(),
+        energy.clone(),
     );
 
     // Start HA MQTT bridge
@@ -208,6 +222,24 @@ fn main() {
             let control_lock = control.lock().unwrap();
             state_store.save_config("mode", &serde_json::to_string(&control_lock.mode).unwrap_or_default().trim_matches('"'));
             state_store.save_config("grid_target_w", &control_lock.grid_target_w.to_string());
+        }
+
+        // Integrate energy + persist
+        {
+            let store_lock = store.lock().unwrap();
+            let ctrl_lock = control.lock().unwrap();
+            let grid_w = store_lock.get(&ctrl_lock.site_meter_driver, &telemetry::DerType::Meter)
+                .map(|m| m.smoothed_w).unwrap_or(0.0);
+            let pv_w: f64 = store_lock.readings_by_type(&telemetry::DerType::Pv).iter().map(|p| p.smoothed_w).sum();
+            let bat_w: f64 = store_lock.readings_by_type(&telemetry::DerType::Battery).iter().map(|b| b.smoothed_w).sum();
+            drop(ctrl_lock);
+            drop(store_lock);
+
+            let mut en = energy.lock().unwrap();
+            en.integrate(grid_w, pv_w, bat_w);
+            if let Ok(json) = serde_json::to_string(&en.state) {
+                state_store.save_config("energy", &json);
+            }
         }
 
         // Record history snapshot

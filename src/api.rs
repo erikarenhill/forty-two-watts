@@ -14,6 +14,7 @@ pub fn start(
     control: Arc<Mutex<ControlState>>,
     driver_capacities: HashMap<String, f64>,
     state_store: Arc<crate::state::StateStore>,
+    energy: Arc<Mutex<crate::energy::EnergyAccumulator>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("api".to_string())
@@ -34,7 +35,8 @@ pub fn start(
 
                 let response = match (method.as_str(), path.as_str()) {
                     ("GET", "/api/health") => handle_health(&store),
-                    ("GET", "/api/status") => handle_status(&store, &control, &driver_capacities),
+                    ("GET", "/api/status") => handle_status(&store, &control, &driver_capacities, &energy),
+                    ("GET", "/api/energy") => handle_energy(&energy),
                     ("GET", "/api/mode") => handle_get_mode(&control),
                     ("POST", "/api/mode") => handle_set_mode(&control, &mut request),
                     ("POST", "/api/target") => handle_set_target(&control, &mut request),
@@ -93,6 +95,7 @@ fn handle_status(
     store: &Arc<Mutex<TelemetryStore>>,
     control: &Arc<Mutex<ControlState>>,
     capacities: &HashMap<String, f64>,
+    energy: &Arc<Mutex<crate::energy::EnergyAccumulator>>,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let mut store = store.lock().unwrap();
     let control = control.lock().unwrap();
@@ -178,6 +181,7 @@ fn handle_status(
         "grid_target_w": control.grid_target_w,
         "peak_limit_w": control.peak_limit_w,
         "ev_charging_w": control.ev_charging_w,
+        "energy": energy.lock().unwrap().state,
         "drivers": drivers,
         "dispatch": targets,
     }))
@@ -252,6 +256,13 @@ fn handle_set_target(
         }
         Err(e) => json_response(400, &serde_json::json!({"error": e.to_string()})),
     }
+}
+
+fn handle_energy(
+    energy: &Arc<Mutex<crate::energy::EnergyAccumulator>>,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    let en = energy.lock().unwrap();
+    json_response(200, &serde_json::to_value(&en.state).unwrap_or(serde_json::Value::Null))
 }
 
 fn handle_set_peak_limit(

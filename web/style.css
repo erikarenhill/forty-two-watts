@@ -602,3 +602,29 @@ footer {
     grid-template-columns: 1fr;
   }
 }
+
+.energy-cards {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.energy-card {
+  padding: 8px 12px;
+}
+
+.energy-card .card-label {
+  font-size: 0.65rem;
+  margin-bottom: 2px;
+}
+
+.energy-card .card-value {
+  font-size: 1.1rem;
+}
+
+@media (max-width: 900px) {
+  .energy-cards {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
