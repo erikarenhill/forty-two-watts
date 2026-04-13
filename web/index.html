@@ -120,14 +120,20 @@
     <!-- Power Chart -->
     <section id="chart-section">
       <div class="chart-header">
-        <h2>Power</h2>
-        <div class="range-buttons" id="range-buttons">
-          <button data-range="5m" class="active">5m</button>
-          <button data-range="15m">15m</button>
-          <button data-range="1h">1h</button>
-          <button data-range="6h">6h</button>
-          <button data-range="24h">24h</button>
-          <button data-range="3d">3d</button>
+        <h2 id="chart-title">Power</h2>
+        <div class="chart-controls">
+          <div class="view-buttons" id="view-buttons">
+            <button data-view="power" class="active">Power (W)</button>
+            <button data-view="energy">Energy (kWh)</button>
+          </div>
+          <div class="range-buttons" id="range-buttons">
+            <button data-range="5m" class="active">5m</button>
+            <button data-range="15m">15m</button>
+            <button data-range="1h">1h</button>
+            <button data-range="6h">6h</button>
+            <button data-range="24h">24h</button>
+            <button data-range="3d">3d</button>
+          </div>
         </div>
       </div>
       <div class="chart-container">

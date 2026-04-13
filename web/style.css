@@ -628,3 +628,30 @@ footer {
     grid-template-columns: repeat(2, 1fr);
   }
 }
+
+.chart-controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.view-buttons {
+  display: flex;
+  gap: 4px;
+}
+
+.view-buttons button {
+  font-size: 0.7rem;
+  padding: 3px 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.view-buttons button.active {
+  background: var(--accent, #3b82f6);
+  color: white;
+  border-color: var(--accent, #3b82f6);
+}

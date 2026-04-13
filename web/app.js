@@ -17,10 +17,17 @@
     ferroamp_target: [],
     sungrow_target: [],
     timestamps: [],
+    // Energy counters (cumulative Wh, today-scoped)
+    e_import: [],
+    e_export: [],
+    e_pv: [],
+    e_charged: [],
+    e_discharged: [],
+    e_load: [],
   };
-  // Last render layout, needed for hover tooltip
   var chartLayout = null;
   var hoverIndex = -1;
+  var chartView = "power"; // "power" or "energy"
 
   // ---- DOM refs ----
   const $ = (id) => document.getElementById(id);
@@ -188,29 +195,29 @@
       if (d.driver === "ferroamp") ft = d.target_w;
       if (d.driver === "sungrow") st = d.target_w;
     });
-    pushChartData(data.grid_w, data.pv_w, data.load_w||0, fd.bat_w||0, sd.bat_w||0, ft, st);
+    pushChartData(data, fd.bat_w||0, sd.bat_w||0, ft, st);
     renderChart();
     // Timestamp is updated in fetchStatus (before render, so it's robust to render errors)
   }
 
-  function pushChartData(grid, pv, load, ferroBat, sunBat, ferroTarget, sunTarget) {
-    chartHistory.grid.push(grid);
-    chartHistory.pv.push(pv);
-    chartHistory.load.push(load);
+  function pushChartData(data, ferroBat, sunBat, ferroTarget, sunTarget) {
+    var t = (data.energy && data.energy.today) || {};
+    chartHistory.grid.push(data.grid_w);
+    chartHistory.pv.push(data.pv_w);
+    chartHistory.load.push(data.load_w || 0);
     chartHistory.ferroamp_bat.push(ferroBat);
     chartHistory.sungrow_bat.push(sunBat);
     chartHistory.ferroamp_target.push(ferroTarget);
     chartHistory.sungrow_target.push(sunTarget);
     chartHistory.timestamps.push(Date.now());
+    chartHistory.e_import.push(t.import_wh || 0);
+    chartHistory.e_export.push(t.export_wh || 0);
+    chartHistory.e_pv.push(t.pv_wh || 0);
+    chartHistory.e_charged.push(t.bat_charged_wh || 0);
+    chartHistory.e_discharged.push(t.bat_discharged_wh || 0);
+    chartHistory.e_load.push(t.load_wh || 0);
     if (chartHistory.grid.length > CHART_POINTS) {
-      chartHistory.grid.shift();
-      chartHistory.pv.shift();
-      chartHistory.load.shift();
-      chartHistory.ferroamp_bat.shift();
-      chartHistory.sungrow_bat.shift();
-      chartHistory.ferroamp_target.shift();
-      chartHistory.sungrow_target.shift();
-      chartHistory.timestamps.shift();
+      Object.keys(chartHistory).forEach(function(k) { chartHistory[k].shift(); });
     }
   }
 
@@ -227,10 +234,33 @@
     var plotW = w - pad.left - pad.right;
     var plotH = h - pad.top - pad.bottom;
 
-    // Find y range across all series
-    var all = chartHistory.grid.concat(chartHistory.pv).concat(chartHistory.load)
-      .concat(chartHistory.ferroamp_bat).concat(chartHistory.sungrow_bat)
-      .concat(chartHistory.ferroamp_target).concat(chartHistory.sungrow_target);
+    // Build series based on view
+    var series;
+    if (chartView === "energy") {
+      // Show cumulative Wh as kWh (divide by 1000)
+      function toKwh(arr) { return arr.map(function(x){ return x / 1000; }); }
+      series = [
+        { data: toKwh(chartHistory.e_import),     color: "#ef4444", width: 2, dash: [], name: "Import" },
+        { data: toKwh(chartHistory.e_export),     color: "#22c55e", width: 2, dash: [], name: "Export" },
+        { data: toKwh(chartHistory.e_pv),         color: "#10b981", width: 2, dash: [], name: "PV" },
+        { data: toKwh(chartHistory.e_charged),    color: "#3b82f6", width: 2, dash: [], name: "Charged" },
+        { data: toKwh(chartHistory.e_discharged), color: "#f59e0b", width: 2, dash: [], name: "Discharged" },
+        { data: toKwh(chartHistory.e_load),       color: "#e2e8f0", width: 2, dash: [], name: "Load" },
+      ];
+    } else {
+      series = [
+        { data: chartHistory.grid,            color: "#ef4444", width: 2, dash: [], name: "Grid" },
+        { data: chartHistory.pv,              color: "#22c55e", width: 2, dash: [], name: "PV" },
+        { data: chartHistory.load,            color: "#e2e8f0", width: 1.5, dash: [], name: "Load" },
+        { data: chartHistory.ferroamp_bat,    color: "#f59e0b", width: 2, dash: [], name: "Ferroamp" },
+        { data: chartHistory.ferroamp_target, color: "#f59e0b", width: 1.5, dash: [6, 4], name: "Ferroamp tgt" },
+        { data: chartHistory.sungrow_bat,     color: "#8b5cf6", width: 2, dash: [], name: "Sungrow" },
+        { data: chartHistory.sungrow_target,  color: "#8b5cf6", width: 1.5, dash: [6, 4], name: "Sungrow tgt" },
+      ];
+    }
+
+    // Find y range across active series
+    var all = series.reduce(function(acc, s) { return acc.concat(s.data); }, []);
     if (all.length === 0) return;
     var yMin = Math.min(0, Math.min.apply(null, all));
     var yMax = Math.max(100, Math.max.apply(null, all));
@@ -255,7 +285,7 @@
       ctx.moveTo(pad.left, y);
       ctx.lineTo(w - pad.right, y);
       ctx.stroke();
-      ctx.fillText(formatW(yVal), 2, y + 4);
+      ctx.fillText(chartView === "energy" ? yVal.toFixed(1) + " kWh" : formatW(yVal), 2, y + 4);
     }
 
     // Zero line
@@ -271,17 +301,7 @@
       ctx.setLineDash([]);
     }
 
-    // Draw series: solid = actual, dashed = target
-    var series = [
-      { data: chartHistory.grid,            color: "#ef4444", width: 2, dash: [] },
-      { data: chartHistory.pv,              color: "#22c55e", width: 2, dash: [] },
-      { data: chartHistory.load,            color: "#e2e8f0", width: 1.5, dash: [] },
-      { data: chartHistory.ferroamp_bat,    color: "#f59e0b", width: 2, dash: [] },       // amber solid
-      { data: chartHistory.ferroamp_target, color: "#f59e0b", width: 1.5, dash: [6, 4] }, // amber dashed
-      { data: chartHistory.sungrow_bat,     color: "#8b5cf6", width: 2, dash: [] },       // purple solid
-      { data: chartHistory.sungrow_target,  color: "#8b5cf6", width: 1.5, dash: [6, 4] }, // purple dashed
-    ];
-
+    // Draw the series chosen above
     series.forEach(function (s) {
       if (s.data.length < 2) return;
       ctx.strokeStyle = s.color;
@@ -343,8 +363,15 @@
       ctx.fill();
     });
 
-    // Tooltip box
-    var labels = [
+    // Tooltip box — labels match current view
+    var labels = chartView === "energy" ? [
+      { name: "Import",     data: chartHistory.e_import,     color: "#ef4444" },
+      { name: "Export",     data: chartHistory.e_export,     color: "#22c55e" },
+      { name: "PV",         data: chartHistory.e_pv,         color: "#10b981" },
+      { name: "Charged",    data: chartHistory.e_charged,    color: "#3b82f6" },
+      { name: "Discharged", data: chartHistory.e_discharged, color: "#f59e0b" },
+      { name: "Load",       data: chartHistory.e_load,       color: "#e2e8f0" },
+    ] : [
       { name: "Grid",     data: chartHistory.grid,     color: "#ef4444" },
       { name: "PV",       data: chartHistory.pv,       color: "#22c55e" },
       { name: "Load",     data: chartHistory.load,     color: "#e2e8f0" },
@@ -384,7 +411,10 @@
       ctx.fillText(lab.name, boxX + 18, y);
       ctx.fillStyle = "#fff";
       ctx.textAlign = "right";
-      ctx.fillText(formatW(lab.data[i]), boxX + boxW - 6, y);
+      var val = chartView === "energy"
+        ? lab.data[i].toFixed(2) + " kWh"
+        : formatW(lab.data[i]);
+      ctx.fillText(val, boxX + boxW - 6, y);
       ctx.textAlign = "left";
     });
   }
@@ -567,6 +597,38 @@
     });
   }
 
+  // Power / Energy view toggle
+  var viewButtons = document.getElementById("view-buttons");
+  var chartTitle = document.getElementById("chart-title");
+  if (viewButtons) {
+    viewButtons.addEventListener("click", function (e) {
+      if (e.target.tagName === "BUTTON" && e.target.dataset.view) {
+        viewButtons.querySelectorAll("button").forEach(function (b) {
+          b.classList.toggle("active", b === e.target);
+        });
+        chartView = e.target.dataset.view;
+        if (chartTitle) chartTitle.textContent = chartView === "energy" ? "Energy (cumulative today)" : "Power";
+        updateLegend();
+        renderChart();
+      }
+    });
+  }
+
+  function updateLegend() {
+    var legend = document.getElementById("chart-legend");
+    if (!legend) return;
+    var items = chartView === "energy" ? [
+      ["#ef4444", "Import"], ["#22c55e", "Export"], ["#10b981", "PV"],
+      ["#3b82f6", "Charged"], ["#f59e0b", "Discharged"], ["#e2e8f0", "Load"],
+    ] : [
+      ["#ef4444", "Grid"], ["#22c55e", "PV"], ["#e2e8f0", "Load"],
+      ["#f59e0b", "Ferroamp"], ["#8b5cf6", "Sungrow"],
+    ];
+    legend.innerHTML = items.map(function(it) {
+      return '<span class="legend-item"><span class="legend-color" style="background:'+it[0]+'"></span> '+it[1]+'</span>';
+    }).join('');
+  }
+
   // ---- Chart hover ----
   var canvas = document.getElementById("power-chart");
   if (canvas) {
@@ -601,19 +663,13 @@
       .then(function (data) {
         if (!data || !data.items) return;
         // Populate chart history from persisted data
-        chartHistory.grid = [];
-        chartHistory.pv = [];
-        chartHistory.load = [];
-        chartHistory.ferroamp_bat = [];
-        chartHistory.sungrow_bat = [];
-        chartHistory.ferroamp_target = [];
-        chartHistory.sungrow_target = [];
-        chartHistory.timestamps = [];
+        Object.keys(chartHistory).forEach(function(k) { chartHistory[k] = []; });
         data.items.forEach(function (it) {
           var fd = (it.drivers || {}).ferroamp || {};
           var sd = (it.drivers || {}).sungrow || {};
           var ft = (it.targets || {}).ferroamp || 0;
           var st = (it.targets || {}).sungrow || 0;
+          var et = it.energy_today || {};
           chartHistory.grid.push(it.grid_w || 0);
           chartHistory.pv.push(it.pv_w || 0);
           chartHistory.load.push(it.load_w || 0);
@@ -622,6 +678,12 @@
           chartHistory.ferroamp_target.push(ft);
           chartHistory.sungrow_target.push(st);
           chartHistory.timestamps.push(it.ts || 0);
+          chartHistory.e_import.push(et.import_wh || 0);
+          chartHistory.e_export.push(et.export_wh || 0);
+          chartHistory.e_pv.push(et.pv_wh || 0);
+          chartHistory.e_charged.push(et.bat_charged_wh || 0);
+          chartHistory.e_discharged.push(et.bat_discharged_wh || 0);
+          chartHistory.e_load.push(et.load_wh || 0);
         });
         renderChart();
       })

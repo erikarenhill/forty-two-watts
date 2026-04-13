@@ -243,7 +243,7 @@ fn main() {
         }
 
         // Record history snapshot
-        record_history_snapshot(&store, &control, &driver_names, &state_store);
+        record_history_snapshot(&store, &control, &driver_names, &state_store, &energy);
 
         // Periodic pruning (every ~30 cycles = 2.5 min)
         if std::time::SystemTime::now()
@@ -274,12 +274,15 @@ fn main() {
     info!("home-ems stopped");
 }
 
-/// Record a telemetry snapshot to history database
+/// Record a telemetry snapshot to history database.
+/// Stores BOTH power (W) for instant view AND cumulative energy (Wh) so charts
+/// can derive average power between samples, or display energy directly.
 fn record_history_snapshot(
     store: &Arc<Mutex<telemetry::TelemetryStore>>,
     control: &Arc<Mutex<control::ControlState>>,
     driver_names: &[String],
     state_store: &Arc<state::StateStore>,
+    energy: &Arc<Mutex<energy::EnergyAccumulator>>,
 ) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -324,6 +327,11 @@ fn record_history_snapshot(
             targets.insert(t.driver.clone(), serde_json::json!(t.target_w));
         }
 
+        // Cumulative energy (Wh) — authoritative source of truth for aggregation
+        let e = energy.lock().unwrap();
+        let today = &e.state.today;
+        let total = &e.state.total;
+
         serde_json::json!({
             "ts": now_ms,
             "grid_w": grid_w,
@@ -333,6 +341,23 @@ fn record_history_snapshot(
             "bat_soc": avg_soc,
             "drivers": drivers,
             "targets": targets,
+            // Energy snapshots: today and all-time cumulative Wh
+            "energy_today": {
+                "import_wh": today.import_wh,
+                "export_wh": today.export_wh,
+                "pv_wh": today.pv_wh,
+                "bat_charged_wh": today.bat_charged_wh,
+                "bat_discharged_wh": today.bat_discharged_wh,
+                "load_wh": today.load_wh,
+            },
+            "energy_total": {
+                "import_wh": total.import_wh,
+                "export_wh": total.export_wh,
+                "pv_wh": total.pv_wh,
+                "bat_charged_wh": total.bat_charged_wh,
+                "bat_discharged_wh": total.bat_discharged_wh,
+                "load_wh": total.load_wh,
+            },
         })
     };
 
