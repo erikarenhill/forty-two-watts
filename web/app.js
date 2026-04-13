@@ -53,6 +53,7 @@
   const ePv = $("e-pv");
   const eCharged = $("e-charged");
   const eDischarged = $("e-discharged");
+  const eLoad = $("e-load");
   const lastUpdate = $("last-update");
   const FUSE_MAX_W = 11040; // 16A * 230V * 3ph
 
@@ -157,6 +158,7 @@
       if (ePv) ePv.textContent = formatKwh(t.pv_wh);
       if (eCharged) eCharged.textContent = formatKwh(t.bat_charged_wh);
       if (eDischarged) eDischarged.textContent = formatKwh(t.bat_discharged_wh);
+      if (eLoad) eLoad.textContent = formatKwh(t.load_wh);
     }
 
     // Fuse gauge (if present)

@@ -6,12 +6,14 @@
 use std::time::Instant;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct EnergyCounters {
     pub import_wh: f64,
     pub export_wh: f64,
     pub pv_wh: f64,
     pub bat_charged_wh: f64,
     pub bat_discharged_wh: f64,
+    pub load_wh: f64,
 }
 
 impl EnergyCounters {
@@ -37,11 +39,17 @@ impl EnergyCounters {
         } else {
             self.bat_discharged_wh += -bat_w * factor;
         }
+
+        // Load = grid - pv - bat (house consumption, energy balance)
+        // Clamp to positive since load can't be negative
+        let load_w = (grid_w - pv_w - bat_w).max(0.0);
+        self.load_wh += load_w * factor;
     }
 }
 
 /// Complete energy state with today + all-time counters
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct EnergyState {
     pub today: EnergyCounters,
     pub total: EnergyCounters,
