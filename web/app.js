@@ -387,6 +387,14 @@
     ctx.rect(pad.left, pad.top, plotW, plotH);
     ctx.clip();
 
+    // Shaded band behind the forecast (future) portion of the chart so
+    // it's immediately obvious what's measured vs predicted.
+    var xNowShade = pad.left + plotW * (now - windowStart) / totalMs;
+    if (xNowShade < pad.left + plotW) {
+      ctx.fillStyle = "rgba(251,191,36,0.06)"; // warm amber
+      ctx.fillRect(xNowShade, pad.top, pad.left + plotW - xNowShade, plotH);
+    }
+
     // Grid lines (drawn inside clip so they only appear in the plot area)
     ctx.strokeStyle = "#2a2a2a";
     ctx.lineWidth = 0.5;
@@ -503,18 +511,22 @@
 
     // ---- Now-line separator (between past actuals and future forecast) ----
     var xNow = tsToX(now);
-    ctx.strokeStyle = "rgba(255,255,255,0.35)";
-    ctx.lineWidth = 1;
-    ctx.setLineDash([2, 3]);
+    ctx.strokeStyle = "rgba(251,191,36,0.75)";
+    ctx.lineWidth = 1.2;
+    ctx.setLineDash([4, 4]);
     ctx.beginPath();
     ctx.moveTo(xNow, pad.top);
     ctx.lineTo(xNow, pad.top + plotH);
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    // "now ·  predicted →" label above the divider
+    ctx.fillStyle = "rgba(251,191,36,0.9)";
     ctx.font = "10px system-ui, sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText("now", xNow, pad.top - 4);
+    ctx.textAlign = "left";
+    ctx.fillText("predicted →", xNow + 4, pad.top + 10);
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.textAlign = "right";
+    ctx.fillText("now", xNow - 4, pad.top + 10);
     ctx.textAlign = "left";
 
     ctx.restore();

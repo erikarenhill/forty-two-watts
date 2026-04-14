@@ -6,6 +6,19 @@ Unified Home Energy Management System. Coordinates multiple batteries + PV +
 grid + loads on a shared grid connection so they don't oscillate or blow the
 main fuse.
 
+Three layers in one binary:
+
+1. **Inner control loop** (5 s) — PI + cascade + fuse + SoC clamps,
+   executes grid-power targets no matter where they come from.
+2. **MPC planner** (15 min) — dynamic programming over a discretized
+   SoC grid, 48-hour horizon, three strategies (self-consumption /
+   cheap charging / arbitrage), confidence-weighted when prices are
+   ML-forecasted.
+3. **Digital twins** (1 min) — online RLS / bucket models that learn
+   the system's PV curve, household load profile, and spot-price
+   pattern from its own telemetry. Feed slot-by-slot forecasts into
+   the MPC.
+
 **This branch (`go-port`)** is the current mainline: **Go + WASM drivers**
 (via wazero). The previous Rust implementation lives on `master` and is
 unchanged.
@@ -46,8 +59,19 @@ capability-scoped sandbox with a tiny host ABI.
 │                                   └────────────────────────┘    │
 │  ┌──────────────────────────┐                                  │
 │  │  SQLite state DB         │  config, events, battery models, │
-│  │  (tiered history)        │  history hot/warm/cold tiers     │
-│  └──────────────────────────┘                                  │
+│  │  (tiered history)        │  history hot/warm/cold tiers,    │
+│  └──────────────────────────┘  prices, forecasts, twin state   │
+│                                                                 │
+│  ┌──────────────────────────┐   ┌────────────────────────┐     │
+│  │  MPC planner (15 min)    │◀──│  Digital twins (1 min) │     │
+│  │  • DP over SoC grid      │   │  • pvmodel (RLS)       │     │
+│  │  • 48 h horizon          │   │  • loadmodel (buckets) │     │
+│  │  • three strategies      │   │  • priceforecast       │     │
+│  │  • confidence blending   │   │  • baked cold-start    │     │
+│  │  • per-slot reasons      │   │    priors + auto-fit   │     │
+│  └────────────┬─────────────┘   └────────────────────────┘     │
+│               │  grid_target_w per slot                         │
+│               └─────▶ consumed by the control loop above        │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -182,6 +206,11 @@ runs the control loop, and verifies:
 - [`docs/battery-models.md`](docs/battery-models.md) — ARX(1), RLS, cascade, self-tune
 - [`docs/clamping.md`](docs/clamping.md) — the seven clamps and why each matters
 - [`docs/configuration.md`](docs/configuration.md) — full YAML schema reference
+- [`docs/mpc-planner.md`](docs/mpc-planner.md) — MPC strategies, confidence blending, decision reasons
+- [`docs/ml-twins.md`](docs/ml-twins.md) — PV + load + price digital twins
+- [`docs/ha-integration.md`](docs/ha-integration.md) — Home Assistant MQTT bridge
+- [`docs/host-api.md`](docs/host-api.md) — WASM driver ABI
+- [`docs/lua-drivers.md`](docs/lua-drivers.md) — legacy Lua driver format
 - [`MIGRATION_PLAN.md`](MIGRATION_PLAN.md) — why Go + WASM, library evaluations
 
 ---

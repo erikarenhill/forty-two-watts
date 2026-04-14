@@ -131,6 +131,39 @@
     ctx.stroke();
     ctx.setLineDash([]);
 
+    // ---- Predicted-zone shade + boundary ----
+    // Find the first ML-forecasted action. Everything at or past that
+    // point gets a translucent band and a "predicted" label, so the
+    // uncertain portion reads as visually different — not just dimmer
+    // bars but a whole different region.
+    if (plan && plan.actions && plan.actions.length) {
+      const firstPred = plan.actions.find(a => a.confidence != null && a.confidence < 1.0);
+      if (firstPred) {
+        const xPred = Math.max(xScale(firstPred.slot_start_ms), pad.l);
+        const xEnd = pad.l + plotW;
+        if (xPred < xEnd) {
+          // Shaded band behind everything in the plot area — strong
+          // enough to read as "this zone is different".
+          ctx.fillStyle = 'rgba(251,191,36,0.10)';
+          ctx.fillRect(xPred, pad.t, xEnd - xPred, plotH);
+          // Boundary line
+          ctx.strokeStyle = 'rgba(251,191,36,0.65)';
+          ctx.lineWidth = 1.2;
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(xPred, pad.t);
+          ctx.lineTo(xPred, pad.t + plotH);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          // Label "predicted →"
+          ctx.fillStyle = 'rgba(251,191,36,0.9)';
+          ctx.font = '10px system-ui, sans-serif';
+          ctx.textAlign = 'left';
+          ctx.fillText('predicted →', xPred + 4, pad.t + 10);
+        }
+      }
+    }
+
     // ---- Price bars ----
     // Color cheap (low) → green, expensive → red.
     const sortedTotals = [...totals].sort((a, b) => a - b);
@@ -152,23 +185,29 @@
       const y = priceY(priceVal);
       const zero = priceY(Math.max(0, priceMin));
       const isPredicted = bar.confidence != null && bar.confidence < 1.0;
-      const alpha = isPredicted ? 0.28 : 0.55;
-      let color;
-      if (priceVal <= p25) color = `rgba(34,197,94,${alpha})`;
-      else if (priceVal >= p75) color = `rgba(239,68,68,${alpha})`;
-      else color = `rgba(148,163,184,${alpha * 0.85})`;
-      ctx.fillStyle = color;
-      ctx.fillRect(x0, Math.min(y, zero), Math.max(1, x1 - x0 - 1), Math.abs(y - zero));
-      // Dashed top outline on predicted bars so the style reads as "ML"
+      // Color by price tercile (cheap/neutral/expensive). Predicted bars
+      // render as a hollow dashed outline so they read as "uncertain
+      // ghost" vs the solid filled real bars.
+      let baseRgb;
+      if (priceVal <= p25) baseRgb = '34,197,94';       // green
+      else if (priceVal >= p75) baseRgb = '239,68,68';  // red
+      else baseRgb = '148,163,184';                     // slate
+      const rectX = x0;
+      const rectY = Math.min(y, zero);
+      const rectW = Math.max(1, x1 - x0 - 1);
+      const rectH = Math.abs(y - zero);
       if (isPredicted) {
-        ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+        // Very faint fill + clear dashed outline
+        ctx.fillStyle = `rgba(${baseRgb},0.10)`;
+        ctx.fillRect(rectX, rectY, rectW, rectH);
+        ctx.strokeStyle = `rgba(${baseRgb},0.75)`;
         ctx.lineWidth = 1;
-        ctx.setLineDash([2, 2]);
-        ctx.beginPath();
-        ctx.moveTo(x0, y);
-        ctx.lineTo(x1 - 1, y);
-        ctx.stroke();
+        ctx.setLineDash([3, 3]);
+        ctx.strokeRect(rectX + 0.5, rectY + 0.5, rectW - 1, rectH - 1);
         ctx.setLineDash([]);
+      } else {
+        ctx.fillStyle = `rgba(${baseRgb},0.60)`;
+        ctx.fillRect(rectX, rectY, rectW, rectH);
       }
       // Track for hover hit-test
       state.priceBarBounds.push({
