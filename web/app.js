@@ -53,6 +53,7 @@
   setInterval(refreshChartPlan, 30000);
   var chartLayout = null;
   var hoverIndex = -1;
+  var hoverForecast = null; // { ts, action } when hovering in future region
   var chartView = "power"; // "power" or "energy"
 
   // ---- DOM refs ----
@@ -304,10 +305,10 @@
     var windowMs = CHART_RANGE_MS[chartRange] || CHART_RANGE_MS["5m"];
     var now = Date.now();
     var windowStart = now - windowMs;
-    // Forward-looking forecast segment. Min 15 min so at least one 15-min
-    // plan slot is visible even at the 5m range; otherwise 30% of window
-    // so long ranges don't get dominated by future space.
-    var futureMs = Math.max(windowMs * 0.3, 15 * 60 * 1000);
+    // Forward-looking forecast is always half the past window, so past
+    // takes 2/3 of the plot width and future 1/3 — keeps the live trace
+    // dominant while still showing what the planner expects coming up.
+    var futureMs = windowMs / 2;
     var windowEnd = now + futureMs;
     var totalMs = windowEnd - windowStart;
 
@@ -641,12 +642,16 @@
       pad: pad, plotW: plotW, plotH: plotH, w: w, h: h,
       yMin: yMin, yMax: yMax, yRange: yRange,
       windowStart: windowStart, windowMs: windowMs,
+      windowEnd: windowEnd, totalMs: totalMs, now: now,
+      plan: chartPlan,
       series: series,
       pointCount: chartHistory.timestamps.length
     };
 
     if (hoverIndex >= 0 && hoverIndex < chartLayout.pointCount) {
       drawHoverOverlay(ctx);
+    } else if (hoverForecast) {
+      drawForecastHoverOverlay(ctx);
     }
   }
 
@@ -667,7 +672,7 @@
     // Map by timestamp (matches the time-anchored line drawing)
     var ts = chartHistory.timestamps[i];
     if (ts == null) return;
-    var x = l.pad.left + l.plotW * (ts - l.windowStart) / l.windowMs;
+    var x = l.pad.left + l.plotW * (ts - l.windowStart) / l.totalMs;
 
     // Vertical line
     ctx.strokeStyle = "rgba(255,255,255,0.3)";
@@ -743,6 +748,75 @@
       ctx.fillText(val, boxX + boxW - 6, y);
       ctx.textAlign = "left";
     });
+  }
+
+  function drawForecastHoverOverlay(ctx) {
+    if (!chartLayout || !hoverForecast) return;
+    var l = chartLayout;
+    var a = hoverForecast.action;
+    var ts = hoverForecast.ts;
+    var x = l.pad.left + l.plotW * (ts - l.windowStart) / l.totalMs;
+
+    // Vertical line
+    ctx.strokeStyle = "rgba(251,191,36,0.4)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath();
+    ctx.moveTo(x, l.pad.top);
+    ctx.lineTo(x, l.pad.top + l.plotH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Tooltip box for forecast values
+    var labels = [
+      { name: "PV pred",   val: a.pv_w,   color: "#86efac" },
+      { name: "Load pred", val: a.load_w, color: "#fde68a" },
+      { name: "Battery",   val: a.battery_w, color: "#f59e0b", showSign: true },
+      { name: "Grid",      val: a.grid_w,    color: "#ef4444", showSign: true },
+      { name: "SoC",       val: a.soc_pct + "%", color: "#60a5fa", literal: true },
+      { name: "Price",     val: a.price_ore.toFixed(0) + " öre/kWh", color: "#fbbf24", literal: true },
+    ];
+
+    var lineHeight = 16;
+    var boxW = 200;
+    var boxH = (labels.length + 2) * lineHeight + 14;
+    var boxX = x + 10;
+    if (boxX + boxW > l.w - 5) boxX = x - boxW - 10;
+    var boxY = l.pad.top + 5;
+
+    ctx.fillStyle = "rgba(20,20,35,0.96)";
+    ctx.strokeStyle = "rgba(251,191,36,0.6)";
+    ctx.lineWidth = 1;
+    ctx.fillRect(boxX, boxY, boxW, boxH);
+    ctx.strokeRect(boxX, boxY, boxW, boxH);
+
+    ctx.font = "10px monospace";
+    var d = new Date(ts);
+    var hh = d.getHours().toString().padStart(2, "0") + ":" + d.getMinutes().toString().padStart(2, "0");
+    ctx.fillStyle = "#fbbf24";
+    ctx.fillText(hh + "  predicted", boxX + 6, boxY + lineHeight - 2);
+
+    labels.forEach(function (lab, idx) {
+      var y = boxY + (idx + 2) * lineHeight - 4;
+      ctx.fillStyle = lab.color;
+      ctx.fillRect(boxX + 6, y - 8, 8, 8);
+      ctx.fillStyle = "#ddd";
+      ctx.fillText(lab.name, boxX + 18, y);
+      ctx.fillStyle = "#fff";
+      ctx.textAlign = "right";
+      var val = lab.literal ? lab.val : formatW(lab.val);
+      ctx.fillText(val, boxX + boxW - 6, y);
+      ctx.textAlign = "left";
+    });
+
+    if (a.reason) {
+      var ry = boxY + (labels.length + 2) * lineHeight + 2;
+      ctx.fillStyle = "#86efac";
+      ctx.font = "italic 10px monospace";
+      // Truncate if too long for box
+      var reason = a.reason.length > 28 ? a.reason.substring(0, 27) + "…" : a.reason;
+      ctx.fillText(reason, boxX + 6, ry);
+    }
   }
 
   function renderDrivers(drivers) {
@@ -982,26 +1056,43 @@
     canvas.addEventListener("mousemove", function (e) {
       if (!chartLayout) return;
       var rect = canvas.getBoundingClientRect();
-      // canvas is sized in CSS px (we use devicePixelRatio inside),
-      // so no scaling needed here
       var x = e.clientX - rect.left;
       var l = chartLayout;
       if (x < l.pad.left || x > l.pad.left + l.plotW) {
-        if (hoverIndex !== -1) hoverIndex = -1;
+        if (hoverIndex !== -1 || hoverForecast) { hoverIndex = -1; hoverForecast = null; }
         return;
       }
-      // Map x → timestamp → nearest point index
-      var hoverTs = l.windowStart + (x - l.pad.left) / l.plotW * l.windowMs;
-      var bestIdx = -1, bestDelta = Infinity;
-      for (var i = 0; i < chartHistory.timestamps.length; i++) {
-        var d = Math.abs(chartHistory.timestamps[i] - hoverTs);
-        if (d < bestDelta) { bestDelta = d; bestIdx = i; }
+      // Map x → timestamp using the FULL plot span (past + future).
+      var hoverTs = l.windowStart + (x - l.pad.left) / l.plotW * l.totalMs;
+      if (hoverTs <= l.now) {
+        // Past: nearest history point
+        var bestIdx = -1, bestDelta = Infinity;
+        for (var i = 0; i < chartHistory.timestamps.length; i++) {
+          var d = Math.abs(chartHistory.timestamps[i] - hoverTs);
+          if (d < bestDelta) { bestDelta = d; bestIdx = i; }
+        }
+        hoverIndex = bestIdx;
+        hoverForecast = null;
+      } else {
+        // Future: find the plan slot covering hoverTs
+        hoverIndex = -1;
+        hoverForecast = null;
+        var plan = l.plan;
+        if (plan && plan.actions) {
+          for (var j = 0; j < plan.actions.length; j++) {
+            var a = plan.actions[j];
+            var aEnd = a.slot_start_ms + a.slot_len_min * 60000;
+            if (hoverTs >= a.slot_start_ms && hoverTs < aEnd) {
+              hoverForecast = { ts: hoverTs, action: a };
+              break;
+            }
+          }
+        }
       }
-      hoverIndex = bestIdx;
-      // animation loop redraws — no manual call needed
     });
     canvas.addEventListener("mouseleave", function () {
       hoverIndex = -1;
+      hoverForecast = null;
     });
   }
 
