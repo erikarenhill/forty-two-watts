@@ -175,6 +175,33 @@ func TestDerTypeRoundtrip(t *testing.T) {
 	}
 }
 
+// ---- SoC preservation ----
+
+func TestStorePreservesSoCWhenMissing(t *testing.T) {
+	// Devices like Ferroamp ESO publish SoC less often than the
+	// power-flow telemetry. In-between ticks have no SoC field — the
+	// store must keep the last-known value rather than dropping back
+	// to nil, which would confuse the MPC and any UI display.
+	s := NewStore()
+	soc := 0.97
+	s.Update("ferroamp", DerBattery, -1500, &soc, nil)
+	if r := s.Get("ferroamp", DerBattery); r == nil || r.SoC == nil || *r.SoC != 0.97 {
+		t.Fatalf("first update: SoC not stored, got %+v", r)
+	}
+	// Next tick: power update only, no SoC.
+	s.Update("ferroamp", DerBattery, -1450, nil, nil)
+	r := s.Get("ferroamp", DerBattery)
+	if r == nil || r.SoC == nil || *r.SoC != 0.97 {
+		t.Errorf("SoC should be preserved across nil-update, got %+v", r)
+	}
+	// Fresh SoC overwrites.
+	soc2 := 0.95
+	s.Update("ferroamp", DerBattery, -1400, &soc2, nil)
+	if r := s.Get("ferroamp", DerBattery); r == nil || r.SoC == nil || *r.SoC != 0.95 {
+		t.Errorf("fresh SoC should overwrite, got %+v", r)
+	}
+}
+
 // ---- Load filter ----
 
 func TestLoadFilterSmoothsNoisy(t *testing.T) {

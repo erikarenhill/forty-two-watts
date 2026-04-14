@@ -158,6 +158,15 @@ func (s *Store) Update(driver string, t DerType, rawW float64, soc *float64, dat
 		s.filters[k] = f
 	}
 	smoothed := f.Update(rawW)
+	// Preserve last-known SoC when the new emit doesn't include one.
+	// Some devices (e.g. Ferroamp ESO) publish SoC less frequently than
+	// the power-flow telemetry; a missing field this tick doesn't mean
+	// the battery has no SoC, just that we haven't heard a fresh number.
+	if soc == nil {
+		if prev, ok := s.readings[k]; ok && prev.SoC != nil {
+			soc = prev.SoC
+		}
+	}
 	s.readings[k] = &DerReading{
 		Driver:    driver,
 		DerType:   t,
