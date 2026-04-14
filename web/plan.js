@@ -68,7 +68,7 @@
     // X range = now → +24h
     const now = Date.now();
     const tMin = now - 30 * 60 * 1000; // 30 min look-back so in-progress slot is visible
-    const tMax = now + 24 * 60 * 60 * 1000;
+    const tMax = now + 48 * 60 * 60 * 1000;
     const xScale = t => pad.l + (t - tMin) / (tMax - tMin) * plotW;
 
     // Price range
@@ -112,7 +112,7 @@
     ctx.fillStyle = 'rgba(255,255,255,0.45)';
     ctx.font = '11px system-ui, sans-serif';
     ctx.textAlign = 'center';
-    for (let h = 0; h <= 24; h += 3) {
+    for (let h = 0; h <= 48; h += 6) {
       const t = now + h * 3600 * 1000;
       const x = xScale(t);
       ctx.beginPath();

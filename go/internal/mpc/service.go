@@ -41,15 +41,26 @@ type Service struct {
 	Load  LoadPredictor  // optional — overrides flat BaseLoad
 	Price PricePredictor // optional — fills in future slots when day-ahead isn't published yet
 
-	// Reactive replan: when the actual PV or load drifts far from what
-	// the current plan slot expected, trigger an off-schedule replan
-	// so the schedule catches up with reality. Default thresholds
-	// (2 kW PV, 1.5 kW load) are a rough "something-meaningful-changed"
-	// signal — tuneable via config.
+	// Reactive replan: when the integrated energy gap between actual
+	// and the plan's current-slot prediction exceeds a threshold over
+	// a rolling ~15-minute window, trigger an off-schedule replan so
+	// the schedule catches up with reality.
+	//
+	// Why energy, not power: a brief cloud shadow or a momentary load
+	// spike both swing instantaneous power by kW but represent
+	// pennies of shifted energy. Arbitrage decisions depend on
+	// kWh-scale drift, not W-scale noise. Integrating over a window
+	// filters the transients and keeps us honest.
 	ReactiveInterval time.Duration // how often to check (default 10s)
 	MinReplanGap     time.Duration // cooldown between reactive replans (default 60s)
-	PVDivergenceW    float64       // |actual − predicted|; 0 disables
-	LoadDivergenceW  float64       // |actual − predicted|; 0 disables
+	PVDivergenceWh   float64       // |integrated gap|; 0 disables (default 500 Wh)
+	LoadDivergenceWh float64       // |integrated gap|; 0 disables (default 400 Wh)
+
+	// Leaky integrals (Wh) of (actual − predicted) over the last
+	// ~WindowMin minutes. Decayed each tick so old divergence fades.
+	pvErrIntWh   float64
+	loadErrIntWh float64
+	lastTickMs   int64
 
 	// SiteMeter is the driver name whose meter reading represents the
 	// site's grid connection. Used by the reactive-replan check to
@@ -90,8 +101,8 @@ func New(st *state.Store, tl *telemetry.Store, zone string, p Params) *Service {
 		Interval:         15 * time.Minute,
 		ReactiveInterval: 10 * time.Second,
 		MinReplanGap:     60 * time.Second,
-		PVDivergenceW:    2000,
-		LoadDivergenceW:  1500,
+		PVDivergenceWh:   500, // 500 Wh sustained gap over ~15 min
+		LoadDivergenceWh: 400,
 		stop:             make(chan struct{}),
 		done:             make(chan struct{}),
 	}
@@ -177,7 +188,7 @@ func (s *Service) loop(ctx context.Context) {
 	t := time.NewTicker(s.Interval)
 	defer t.Stop()
 	var reactiveTick <-chan time.Time
-	if s.ReactiveInterval > 0 && (s.PVDivergenceW > 0 || s.LoadDivergenceW > 0) {
+	if s.ReactiveInterval > 0 && (s.PVDivergenceWh > 0 || s.LoadDivergenceWh > 0) {
 		rt := time.NewTicker(s.ReactiveInterval)
 		defer rt.Stop()
 		reactiveTick = rt.C
@@ -231,29 +242,57 @@ func (s *Service) checkDivergence(ctx context.Context) {
 	for _, r := range s.Tele.ReadingsByType(telemetry.DerPV) {
 		pvW += r.SmoothedW
 	}
-	pvErr := math.Abs(pvW - slot.PVW)
 
 	// Live load = grid − pv − bat when we have a site meter wired.
-	var loadErr float64
+	var loadW float64
+	haveLoad := false
 	if s.SiteMeter != "" {
 		if m := s.Tele.Get(s.SiteMeter, telemetry.DerMeter); m != nil {
 			var batW float64
 			for _, r := range s.Tele.ReadingsByType(telemetry.DerBattery) {
 				batW += r.SmoothedW
 			}
-			loadW := m.SmoothedW - pvW - batW
+			loadW = m.SmoothedW - pvW - batW
 			if loadW < 0 {
 				loadW = 0
 			}
-			loadErr = math.Abs(loadW - slot.LoadW)
+			haveLoad = true
 		}
 	}
 
+	// Leaky integral of energy error (Wh). Decay with a 15-minute
+	// half-life so transients fade but a sustained offset accumulates.
+	// decay = 0.5^(dt/halflife), halflife = 900s.
+	const halflifeS = 900.0
+	tickMs := time.Now().UnixMilli()
+	dtS := 0.0
+	if s.lastTickMs > 0 {
+		dtS = float64(tickMs-s.lastTickMs) / 1000.0
+	}
+	s.lastTickMs = tickMs
+	decay := 1.0
+	if dtS > 0 {
+		decay = math.Pow(0.5, dtS/halflifeS)
+	}
+	dtH := dtS / 3600.0
+	pvErrW := pvW - slot.PVW
+	s.mu.Lock()
+	s.pvErrIntWh = s.pvErrIntWh*decay + pvErrW*dtH
+	if haveLoad {
+		loadErrW := loadW - slot.LoadW
+		s.loadErrIntWh = s.loadErrIntWh*decay + loadErrW*dtH
+	} else {
+		s.loadErrIntWh *= decay
+	}
+	pvInt := s.pvErrIntWh
+	loadInt := s.loadErrIntWh
+	s.mu.Unlock()
+
 	reason := ""
 	switch {
-	case s.PVDivergenceW > 0 && pvErr > s.PVDivergenceW:
+	case s.PVDivergenceWh > 0 && math.Abs(pvInt) > s.PVDivergenceWh:
 		reason = "reactive-pv"
-	case s.LoadDivergenceW > 0 && loadErr > s.LoadDivergenceW:
+	case s.LoadDivergenceWh > 0 && math.Abs(loadInt) > s.LoadDivergenceWh:
 		reason = "reactive-load"
 	}
 	if reason == "" {
@@ -261,9 +300,15 @@ func (s *Service) checkDivergence(ctx context.Context) {
 	}
 	slog.Info("mpc: reactive replan",
 		"reason", reason,
-		"pv_gap_w", pvErr, "plan_pv_w", slot.PVW, "actual_pv_w", pvW,
-		"load_gap_w", loadErr, "plan_load_w", slot.LoadW)
+		"pv_err_wh", pvInt, "loadint_wh", loadInt,
+		"pv_w_now", pvW, "plan_pv_w", slot.PVW,
+		"load_w_now", loadW, "plan_load_w", slot.LoadW)
 	s.lastReason = reason
+	// Reset integrals after triggering so we don't immediately re-fire.
+	s.mu.Lock()
+	s.pvErrIntWh = 0
+	s.loadErrIntWh = 0
+	s.mu.Unlock()
 	s.replan(ctx)
 }
 
