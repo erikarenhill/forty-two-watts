@@ -2,6 +2,7 @@ package drivers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -36,8 +37,46 @@ func NewRegistry(rt *Runtime, tel *telemetry.Store) *Registry {
 	}
 }
 
+// driverRuntime abstracts over WASM and Lua driver backends so the
+// registry's run-loop, command dispatch, and health tracking don't
+// care which flavor a driver was authored in.
+type driverRuntime interface {
+	Init(ctx context.Context, configJSON []byte) error
+	Poll(ctx context.Context) (time.Duration, error)
+	Command(ctx context.Context, cmdJSON []byte) error
+	DefaultMode(ctx context.Context) error
+	Cleanup(ctx context.Context) error
+	Env() *HostEnv
+}
+
+// wasmRuntime adapts *Driver (wazero-backed) to driverRuntime.
+type wasmRuntime struct{ *Driver }
+
+func (w *wasmRuntime) Init(ctx context.Context, cfg []byte) error {
+	if cfg == nil {
+		cfg = []byte(`{}`)
+	}
+	return w.Driver.Init(ctx, cfg)
+}
+
+// luaRuntime adapts *LuaDriver to driverRuntime. Note LuaDriver's
+// internal signatures take a map (not raw JSON) for ergonomics, so we
+// decode once at the boundary.
+type luaRuntime struct{ *LuaDriver }
+
+func (l *luaRuntime) Init(ctx context.Context, cfg []byte) error {
+	var m map[string]any
+	if len(cfg) > 0 {
+		_ = json.Unmarshal(cfg, &m)
+	}
+	return l.LuaDriver.Init(ctx, m)
+}
+func (l *luaRuntime) DefaultMode(ctx context.Context) error { return l.LuaDriver.DefaultMode() }
+func (l *luaRuntime) Cleanup(ctx context.Context) error     { l.LuaDriver.Cleanup(); return nil }
+func (l *luaRuntime) Env() *HostEnv                         { return l.LuaDriver.Env }
+
 type runningDriver struct {
-	driver *Driver
+	driver driverRuntime
 	env    *HostEnv
 	cfg    config.Driver
 	// Poll loop coordination
@@ -62,8 +101,8 @@ func (r *Registry) Add(ctx context.Context, cfg config.Driver) error {
 	}
 	r.mu.Unlock()
 
-	if cfg.WASM == "" {
-		return fmt.Errorf("driver %q: only WASM drivers supported in Go port (got lua=%q)", cfg.Name, cfg.Lua)
+	if cfg.WASM == "" && cfg.Lua == "" {
+		return fmt.Errorf("driver %q: must specify `wasm` or `lua` path", cfg.Name)
 	}
 
 	env := NewHostEnv(cfg.Name, r.tel)
@@ -82,14 +121,26 @@ func (r *Registry) Add(ctx context.Context, cfg config.Driver) error {
 		env.WithModbus(cap)
 	}
 
-	drv, err := r.runtime.Load(ctx, cfg.WASM, env)
-	if err != nil {
-		return fmt.Errorf("load wasm: %w", err)
+	// Pick driver runtime based on file extension. Lua is preferred
+	// (community-friendly, hot-editable); WASM stays available for
+	// anyone who built a .wasm driver on v2.0.
+	var drv driverRuntime
+	if cfg.Lua != "" {
+		luaDrv, err := NewLuaDriver(cfg.Lua, env)
+		if err != nil {
+			return fmt.Errorf("load lua: %w", err)
+		}
+		drv = &luaRuntime{LuaDriver: luaDrv}
+	} else {
+		wdrv, err := r.runtime.Load(ctx, cfg.WASM, env)
+		if err != nil {
+			return fmt.Errorf("load wasm: %w", err)
+		}
+		drv = &wasmRuntime{Driver: wdrv}
 	}
 
-	// Serialize the driver config as init JSON
-	if err := drv.Init(ctx, []byte(`{}`)); err != nil {
-		_ = drv.Cleanup(ctx)
+	if err := drv.Init(ctx, nil); err != nil {
+		drv.Cleanup(ctx)
 		return fmt.Errorf("driver_init: %w", err)
 	}
 
@@ -105,7 +156,12 @@ func (r *Registry) Add(ctx context.Context, cfg config.Driver) error {
 	r.rec[cfg.Name] = rd
 	r.mu.Unlock()
 	go r.runLoop(rd)
-	slog.Info("driver added", "name", cfg.Name, "wasm", cfg.WASM)
+	kind := "lua"
+	path := cfg.Lua
+	if cfg.WASM != "" {
+		kind, path = "wasm", cfg.WASM
+	}
+	slog.Info("driver added", "name", cfg.Name, "kind", kind, "path", path)
 	return nil
 }
 
