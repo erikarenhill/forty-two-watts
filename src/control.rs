@@ -275,18 +275,16 @@ pub fn compute_dispatch_with_models(
 
     // ---- Cascade: per-battery inner PI + saturation clamp + inverse model ----
     //
-    // Layered safety:
-    //   1. Saturation clamp — ALWAYS safe (pure empirical observation of what
-    //      the battery can physically do at a given SoC). Applied regardless of
-    //      model confidence.
-    //   2. Inner PI + inverse model — ONLY when model.confidence() ≥ 0.5.
-    //      Below that threshold, an unconverged model would actively *harm*
-    //      stability by amplifying commands based on noisy gain/τ estimates.
+    // Low-confidence models do NOTHING: no saturation clamp, no inner PI, no
+    // inverse model. Reason: every learned artifact (RLS params AND saturation
+    // curves) is contaminated by the early bad observations. The saturation
+    // curve in particular is self-reinforcing — if we clamp to X, actual = X,
+    // the curve's "max seen" stays at X, clamp stays at X forever.
     //
-    // This is why Sungrow (confident model) and Ferroamp (ARX(1) poorly fits
-    // its MQTT+hysteresis behaviour) can coexist: Sungrow gets full cascade
-    // benefit, Ferroamp falls through to direct command + saturation clamp
-    // until its model proves itself (or a self-tune sets a baseline).
+    // High-confidence models get the full cascade: saturation clamp → inner
+    // PI → inverse model. Confidence ≥ 0.5 means enough independent samples
+    // AND low residual variance, which only happens after the model has been
+    // probed over a range of states (e.g. by self-tune or varied dispatch).
     const CASCADE_CONFIDENCE_THRESHOLD: f64 = 0.5;
 
     if state.use_cascade && !models.is_empty() {
@@ -295,25 +293,27 @@ pub fn compute_dispatch_with_models(
                 Some(m) => m,
                 None => continue, // no model yet → use raw target
             };
+
+            // Low-confidence: bypass the entire cascade. Trust the raw
+            // distribute_proportional target + later slew + fuse guard.
+            if model.confidence() < CASCADE_CONFIDENCE_THRESHOLD {
+                continue;
+            }
+
             let bat = batteries.iter().find(|b| b.driver == target.driver);
             let (actual, soc) = match bat {
                 Some(b) => (b.current_w, b.soc),
                 None => continue,
             };
 
-            // 1. Saturation clamp — always applied. Prevents asking for more
-            //    than we've ever physically seen the battery deliver at this SoC.
+            // 1. Saturation clamp — empirical SoC curve. Only trusted when
+            //    confidence is high (curve values won't be self-reinforcing
+            //    artifacts).
             let (clamped_target, sat_clamped) = model.clamp_to_saturation(target.target_w, soc);
             if sat_clamped { target.clamped = true; }
 
-            // Low-confidence models: stop here. Direct command, no amplification.
-            if model.confidence() < CASCADE_CONFIDENCE_THRESHOLD {
-                target.target_w = clamped_target;
-                continue;
-            }
-
             // 2. Inner PI — per-battery tracking of target vs actual. Auto-tuned
-            //    from learned τ. Only active for confident models.
+            //    from learned τ.
             let pi_out = {
                 let inner = state.inner_pis.entry(target.driver.clone())
                     .or_insert_with(InnerPi::new);

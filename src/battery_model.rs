@@ -322,6 +322,12 @@ impl BatteryModel {
     }
 }
 
+/// Minimum observation magnitude before we'll seed a new SoC bucket. Prevents
+/// clamp-induced small observations from creating self-reinforcing entries —
+/// if we're being clamped to 255W and actual = 255W, we don't want to record
+/// "255W is the max at this SoC" as that locks the clamp forever.
+const MIN_SATURATION_SEED_W: f64 = 1000.0;
+
 fn update_saturation_curves(m: &mut BatteryModel, actual: f64, soc: f64) {
     let bucket = (soc / SOC_BUCKET).round() * SOC_BUCKET;
     let bucket = bucket.clamp(0.0, 1.0);
@@ -340,12 +346,17 @@ fn update_saturation_curves(m: &mut BatteryModel, actual: f64, soc: f64) {
 fn update_one_curve(curve: &mut Vec<(f64, f64)>, bucket: f64, value: f64) {
     match curve.binary_search_by(|e| e.0.partial_cmp(&bucket).unwrap_or(std::cmp::Ordering::Equal)) {
         Ok(idx) => {
+            // Raise existing bucket only — never lower via observation
             if value > curve[idx].1 {
                 curve[idx].1 = value;
             }
         }
         Err(idx) => {
-            curve.insert(idx, (bucket, value));
+            // Seed a new bucket only with a meaningfully large observation.
+            // This prevents a small clamp-induced value from locking the bucket.
+            if value >= MIN_SATURATION_SEED_W {
+                curve.insert(idx, (bucket, value));
+            }
         }
     }
 }
@@ -456,11 +467,13 @@ mod tests {
     #[test]
     fn saturation_curves_grow_correctly() {
         let mut m = BatteryModel::new("sat");
-        // Push observations across SoC range
+        // Push observations across SoC range — all above MIN_SATURATION_SEED_W
+        // so new buckets can actually be seeded
         let mut now = 0u64;
         for i in 0..100 {
             let soc = (i as f64) / 100.0;
-            let actual = if soc < 0.95 { 4500.0 } else { 1000.0 * (1.0 - soc) * 20.0 };
+            // 4500W across most of the range, then a hard derate above 95%
+            let actual = if soc < 0.95 { 4500.0 } else { 4500.0 * (1.0 - soc) / 0.05 };
             m.update(5000.0, actual, soc, 5.0, now);
             now += 5000;
         }
@@ -469,6 +482,21 @@ mod tests {
         let low = interpolate_curve(&m.max_charge_curve, 0.5).unwrap();
         let high = interpolate_curve(&m.max_charge_curve, 0.98).unwrap();
         assert!(low > high, "expected derating at high SoC: low={} high={}", low, high);
+    }
+
+    #[test]
+    fn saturation_curve_ignores_small_observations() {
+        // Regression test: if we're clamped to 255W and actual = 255W, we must
+        // NOT record 255W as a bucket — that would lock us at 255W forever.
+        let mut m = BatteryModel::new("locked");
+        for _ in 0..20 {
+            m.update(-500.0, -255.0, 0.5, 5.0, 1000);
+        }
+        assert!(
+            m.max_discharge_curve.is_empty(),
+            "small clamp-induced values must not seed curve; got {:?}",
+            m.max_discharge_curve
+        );
     }
 
     #[test]
