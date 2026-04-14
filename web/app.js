@@ -54,6 +54,10 @@
   var chartLayout = null;
   var hoverIndex = -1;
   var hoverForecast = null; // { ts, action } when hovering in future region
+  // Per-series visibility toggled by clicking legend items. Persisted
+  // to localStorage so reload keeps the operator's view.
+  var legendHidden = {};
+  try { legendHidden = JSON.parse(localStorage.getItem("legend-hidden") || "{}") || {}; } catch (e) { legendHidden = {}; }
   var chartView = "power"; // "power" or "energy"
 
   // ---- DOM refs ----
@@ -326,14 +330,16 @@
       ];
     } else {
       series = [
-        { data: chartHistory.grid,            color: "#ef4444", width: 2,   dash: [],     name: "Grid",         fill: true },
-        { data: chartHistory.pv,              color: "#22c55e", width: 2,   dash: [],     name: "PV",           fill: true },
-        { data: chartHistory.load,            color: "#e2e8f0", width: 1.5, dash: [],     name: "Load",         fill: false },
-        { data: chartHistory.ferroamp_bat,    color: "#f59e0b", width: 2,   dash: [],     name: "Ferroamp",     fill: false },
-        { data: chartHistory.ferroamp_target, color: "#f59e0b", width: 1.5, dash: [6, 4], name: "Ferroamp tgt", fill: false },
-        { data: chartHistory.sungrow_bat,     color: "#8b5cf6", width: 2,   dash: [],     name: "Sungrow",      fill: false },
-        { data: chartHistory.sungrow_target,  color: "#8b5cf6", width: 1.5, dash: [6, 4], name: "Sungrow tgt",  fill: false },
+        { data: chartHistory.grid,            color: "#ef4444", width: 2,   dash: [],     name: "Grid",         fill: true,  toggle: "grid" },
+        { data: chartHistory.pv,              color: "#22c55e", width: 2,   dash: [],     name: "PV",           fill: true,  toggle: "pv" },
+        { data: chartHistory.load,            color: "#e2e8f0", width: 1.5, dash: [],     name: "Load",         fill: false, toggle: "load" },
+        { data: chartHistory.ferroamp_bat,    color: "#f59e0b", width: 2,   dash: [],     name: "Ferroamp",     fill: false, toggle: "ferroamp" },
+        { data: chartHistory.ferroamp_target, color: "#f59e0b", width: 1.5, dash: [6, 4], name: "Ferroamp tgt", fill: false, toggle: "ferroamp" },
+        { data: chartHistory.sungrow_bat,     color: "#8b5cf6", width: 2,   dash: [],     name: "Sungrow",      fill: false, toggle: "sungrow" },
+        { data: chartHistory.sungrow_target,  color: "#8b5cf6", width: 1.5, dash: [6, 4], name: "Sungrow tgt",  fill: false, toggle: "sungrow" },
       ];
+      // Respect click-to-hide from legend.
+      series = series.filter(function (s) { return !legendHidden[s.toggle]; });
     }
 
     // Y range only across points within the visible time window
@@ -517,8 +523,8 @@
         ctx.stroke();
         ctx.setLineDash([]);
       };
-      drawForecast("pv_w",   "#86efac", lastActualPV);
-      drawForecast("load_w", "#fde68a", lastActualLoad);
+      if (!legendHidden.pv_fc)   drawForecast("pv_w",   "#86efac", lastActualPV);
+      if (!legendHidden.load_fc) drawForecast("load_w", "#fde68a", lastActualLoad);
     }
 
     // ---- Now-line separator (between past actuals and future forecast) ----
@@ -1003,6 +1009,26 @@
   evSend.addEventListener("click", function () {
     setEvCharging(Number(evSlider.value));
   });
+
+  // Click-to-toggle legend items. Each item has data-toggle with a
+  // key; clicking toggles visibility of the matching series and
+  // persists to localStorage.
+  var chartLegend = document.getElementById("chart-legend");
+  if (chartLegend) {
+    // Apply persisted "off" state on initial render.
+    chartLegend.querySelectorAll(".legend-item[data-toggle]").forEach(function (el) {
+      if (legendHidden[el.dataset.toggle]) el.classList.add("legend-off");
+    });
+    chartLegend.addEventListener("click", function (e) {
+      var item = e.target.closest(".legend-item[data-toggle]");
+      if (!item) return;
+      var key = item.dataset.toggle;
+      legendHidden[key] = !legendHidden[key];
+      item.classList.toggle("legend-off", !!legendHidden[key]);
+      try { localStorage.setItem("legend-hidden", JSON.stringify(legendHidden)); } catch (e2) {}
+      renderChart();
+    });
+  }
 
   // Range selector
   var rangeButtons = document.getElementById("range-buttons");

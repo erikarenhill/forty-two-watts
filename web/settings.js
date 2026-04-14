@@ -104,18 +104,26 @@
     return node == null ? dflt : node;
   }
 
-  function field(label, path, type, dflt) {
+  // help() builds a "?" badge next to a field label that shows an
+  // explanation on hover. Kept as HTML attrs so no JS wiring needed
+  // — the browser's native tooltip is enough for a first pass, and
+  // we also style a nicer custom one via :hover::after in CSS.
+  function help(text) {
+    return '<span class="help" data-help="' + escHtml(text) + '" title="' + escHtml(text) + '">?</span>';
+  }
+
+  function field(label, path, type, dflt, helpText) {
     var val = getByPath(currentConfig, path, dflt);
-    return '<label>' + label + '</label>' +
+    return '<label>' + label + (helpText ? ' ' + help(helpText) : '') + '</label>' +
       '<input type="' + type + '" data-path="' + path + '" value="' + (val == null ? "" : val) + '">';
   }
 
-  function selectField(label, path, options, dflt) {
+  function selectField(label, path, options, dflt, helpText) {
     var val = getByPath(currentConfig, path, dflt);
     var opts = options.map(function (o) {
       return '<option value="' + o + '"' + (o === val ? ' selected' : '') + '>' + o + '</option>';
     }).join("");
-    return '<label>' + label + '</label>' +
+    return '<label>' + label + (helpText ? ' ' + help(helpText) : '') + '</label>' +
       '<select data-path="' + path + '">' + opts + '</select>';
   }
 
@@ -155,40 +163,51 @@
         if (!currentConfig.drivers) currentConfig.drivers = [];
         html = '<div class="devices-list">';
         currentConfig.drivers.forEach(function (d, idx) {
-          var protocol = d.mqtt ? "mqtt" : (d.modbus ? "modbus" : "?");
+          // Go-port config: d.wasm (or legacy d.lua), capabilities.mqtt/modbus
+          var cap = d.capabilities || {};
+          var mqtt = cap.mqtt || d.mqtt; // legacy fallback
+          var modbus = cap.modbus || d.modbus;
+          var protocol = mqtt ? "mqtt" : (modbus ? "modbus" : "?");
+          var driverFile = d.wasm || d.lua || "(none)";
+          var fmtKind = d.wasm ? "wasm" : (d.lua ? "lua" : "?");
           html += '<div class="device-item">' +
             '<div class="device-item-header">' +
             '<strong>' + escHtml(d.name) + '</strong>' +
-            '<span style="color:var(--text-dim);font-size:0.75rem">' + protocol + ' · ' + escHtml(d.lua) + '</span>' +
+            '<span style="color:var(--text-dim);font-size:0.75rem">' + fmtKind + ' · ' + protocol + ' · ' + escHtml(driverFile) + '</span>' +
             '<button class="btn-remove" data-remove-idx="' + idx + '">Remove</button>' +
             '</div>' +
             '<div class="field-row"><div>' +
-            '<label>Lua driver</label><input type="text" data-path="drivers.' + idx + '.lua" value="' + escHtml(d.lua) + '">' +
+            '<label>Driver file ' + help('Path to the .wasm (or legacy .lua) driver. Absolute or relative to the config file directory.') + '</label>' +
+            '<input type="text" data-path="drivers.' + idx + '.' + fmtKind + '" value="' + escHtml(driverFile) + '">' +
             '</div><div>' +
-            '<label>Battery capacity (Wh)</label><input type="number" data-path="drivers.' + idx + '.battery_capacity_wh" value="' + (d.battery_capacity_wh || 0) + '">' +
+            '<label>Battery capacity (Wh) ' + help('Nameplate storage capacity in watt-hours. Used for SoC scaling and MPC planning.') + '</label>' +
+            '<input type="number" data-path="drivers.' + idx + '.battery_capacity_wh" value="' + (d.battery_capacity_wh || 0) + '">' +
             '</div></div>' +
-            '<label><input type="checkbox" data-checkbox-path="drivers.' + idx + '.is_site_meter"' + (d.is_site_meter ? ' checked' : '') + '> Site meter (this drivers grid reading defines site grid)</label>';
-          if (d.mqtt) {
+            '<label><input type="checkbox" data-checkbox-path="drivers.' + idx + '.is_site_meter"' + (d.is_site_meter ? ' checked' : '') + '> Site meter ' + help('Exactly one driver should be the site meter — its grid reading defines the point-of-measurement the PI loop balances.') + '</label>';
+          if (mqtt) {
             html += '<fieldset><legend>MQTT</legend>' +
               '<div class="field-row"><div>' +
-              '<label>Host</label><input type="text" data-path="drivers.' + idx + '.mqtt.host" value="' + escHtml(d.mqtt.host) + '">' +
+              '<label>Host ' + help('IP or hostname of the MQTT broker exposing the device data (e.g. the Ferroamp EnergyHub).') + '</label>' +
+              '<input type="text" data-path="drivers.' + idx + '.capabilities.mqtt.host" value="' + escHtml(mqtt.host) + '">' +
               '</div><div>' +
-              '<label>Port</label><input type="number" data-path="drivers.' + idx + '.mqtt.port" value="' + (d.mqtt.port || 1883) + '">' +
+              '<label>Port</label><input type="number" data-path="drivers.' + idx + '.capabilities.mqtt.port" value="' + (mqtt.port || 1883) + '">' +
               '</div></div>' +
               '<div class="field-row"><div>' +
-              '<label>Username</label><input type="text" data-path="drivers.' + idx + '.mqtt.username" value="' + escHtml(d.mqtt.username || "") + '">' +
+              '<label>Username</label><input type="text" data-path="drivers.' + idx + '.capabilities.mqtt.username" value="' + escHtml(mqtt.username || "") + '">' +
               '</div><div>' +
-              '<label>Password</label><input type="password" data-path="drivers.' + idx + '.mqtt.password" value="' + escHtml(d.mqtt.password || "") + '">' +
+              '<label>Password</label><input type="password" data-path="drivers.' + idx + '.capabilities.mqtt.password" value="' + escHtml(mqtt.password || "") + '">' +
               '</div></div></fieldset>';
           }
-          if (d.modbus) {
+          if (modbus) {
             html += '<fieldset><legend>Modbus TCP</legend>' +
               '<div class="field-row"><div>' +
-              '<label>Host</label><input type="text" data-path="drivers.' + idx + '.modbus.host" value="' + escHtml(d.modbus.host) + '">' +
+              '<label>Host ' + help('IP of the Modbus-TCP device (e.g. Sungrow inverter LAN port).') + '</label>' +
+              '<input type="text" data-path="drivers.' + idx + '.capabilities.modbus.host" value="' + escHtml(modbus.host) + '">' +
               '</div><div>' +
-              '<label>Port</label><input type="number" data-path="drivers.' + idx + '.modbus.port" value="' + (d.modbus.port || 502) + '">' +
+              '<label>Port</label><input type="number" data-path="drivers.' + idx + '.capabilities.modbus.port" value="' + (modbus.port || 502) + '">' +
               '</div></div>' +
-              '<label>Unit ID</label><input type="number" data-path="drivers.' + idx + '.modbus.unit_id" value="' + (d.modbus.unit_id || 1) + '">' +
+              '<label>Unit ID ' + help('Slave address. Usually 1 for a single-device setup.') + '</label>' +
+              '<input type="number" data-path="drivers.' + idx + '.capabilities.modbus.unit_id" value="' + (modbus.unit_id || 1) + '">' +
               '</fieldset>';
           }
           html += '</div>';
@@ -266,18 +285,23 @@
         currentConfig.drivers.forEach(function (d) {
           if (d.battery_capacity_wh > 0) {
             if (!currentConfig.batteries[d.name]) currentConfig.batteries[d.name] = {};
-            html += '<fieldset><legend>' + escHtml(d.name) + '</legend>' +
+            html += '<fieldset><legend>' + escHtml(d.name) + ' &mdash; ' + (d.battery_capacity_wh/1000).toFixed(1) + ' kWh</legend>' +
               '<div class="field-row"><div>' +
-              field("Min SoC (0-1)", "batteries." + d.name + ".soc_min", "number", "") +
+              field("Min SoC (fraction 0–1)", "batteries." + d.name + ".soc_min", "number", "",
+                "Lower SoC bound the planner is allowed to discharge to. 0.10 = 10%. Leave blank to use the battery BMS default.") +
               '</div><div>' +
-              field("Max SoC (0-1)", "batteries." + d.name + ".soc_max", "number", "") +
+              field("Max SoC (fraction 0–1)", "batteries." + d.name + ".soc_max", "number", "",
+                "Upper SoC bound the planner is allowed to charge to. 0.95 = 95%. Avoid 1.0 to extend battery life.") +
               '</div></div>' +
               '<div class="field-row"><div>' +
-              field("Max charge (W)", "batteries." + d.name + ".max_charge_w", "number", "") +
+              field("Max charge (W)", "batteries." + d.name + ".max_charge_w", "number", "",
+                "Peak charge rate the driver will command. Defaults to 0.5C (half capacity).") +
               '</div><div>' +
-              field("Max discharge (W)", "batteries." + d.name + ".max_discharge_w", "number", "") +
+              field("Max discharge (W)", "batteries." + d.name + ".max_discharge_w", "number", "",
+                "Peak discharge rate the driver will command. Defaults to 0.5C.") +
               '</div></div>' +
-              field("Weight (for weighted mode)", "batteries." + d.name + ".weight", "number", 1) +
+              field("Weight (for weighted mode)", "batteries." + d.name + ".weight", "number", 1,
+                "Share of correction this battery takes when control mode is 'weighted'. 1.0 = equal with other batteries.") +
               '</fieldset>';
           }
         });

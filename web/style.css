@@ -996,6 +996,53 @@ footer {
 }
 .card-hint-warn { color: #fbbf24; }
 
+/* Help "?" badges with hover bubble. Uses native `title` attr too for
+   a fallback; the nicer custom tooltip appears on hover via CSS. */
+.help {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  line-height: 14px;
+  text-align: center;
+  font-size: 0.7rem;
+  border-radius: 50%;
+  background: rgba(96,165,250,0.2);
+  color: #60a5fa;
+  cursor: help;
+  margin-left: 4px;
+  position: relative;
+  font-weight: 600;
+}
+.help:hover { background: rgba(96,165,250,0.4); }
+.help:hover::after {
+  content: attr(data-help);
+  position: absolute;
+  left: 20px;
+  top: -4px;
+  background: rgba(15,23,42,0.98);
+  border: 1px solid rgba(96,165,250,0.4);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 0.72rem;
+  font-weight: normal;
+  color: #e2e8f0;
+  white-space: normal;
+  width: 260px;
+  z-index: 100;
+  pointer-events: none;
+  box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+  line-height: 1.35;
+}
+
+/* Click-to-toggle chart legend items. */
+.legend-item {
+  cursor: pointer;
+  user-select: none;
+  transition: opacity 0.15s;
+}
+.legend-item:hover { opacity: 0.8; }
+.legend-item.legend-off { opacity: 0.3; text-decoration: line-through; }
+
 .strategy-hint {
   font-size: 0.78rem;
   color: var(--text-dim, #94a3b8);
