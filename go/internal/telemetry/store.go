@@ -248,6 +248,36 @@ func (s *Store) AllHealth() map[string]DriverHealth {
 	return out
 }
 
+// WatchdogScan checks each known driver's LastSuccess timestamp against
+// timeout and toggles Status accordingly. Returns the list of drivers whose
+// status just changed (name → new online state). Call this once per control
+// cycle so the control loop can react (e.g. exclude offline drivers from
+// dispatch and ask them to revert to autonomous mode).
+func (s *Store) WatchdogScan(timeout time.Duration) []WatchdogTransition {
+	s.mu.Lock(); defer s.mu.Unlock()
+	now := time.Now()
+	var out []WatchdogTransition
+	for name, h := range s.health {
+		stale := h.LastSuccess == nil || now.Sub(*h.LastSuccess) > timeout
+		wasOnline := h.Status != StatusOffline
+		if stale && wasOnline {
+			h.Status = StatusOffline
+			out = append(out, WatchdogTransition{Name: name, Online: false})
+		} else if !stale && !wasOnline {
+			h.Status = StatusOk
+			h.ConsecutiveErrors = 0
+			out = append(out, WatchdogTransition{Name: name, Online: true})
+		}
+	}
+	return out
+}
+
+// WatchdogTransition describes a driver whose online state just flipped.
+type WatchdogTransition struct {
+	Name   string
+	Online bool
+}
+
 // UpdateLoad applies the slow load filter. load = grid - pv - bat is noisy
 // because battery responds faster than the grid meter sees the change. This
 // filter gives a stable house-load estimate.

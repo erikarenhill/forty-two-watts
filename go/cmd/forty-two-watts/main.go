@@ -461,6 +461,33 @@ func main() {
 				modelsMu.Unlock()
 			}
 
+			// ---- Watchdog: mark stale drivers offline, revert them to autonomous ----
+			watchdogTimeout := time.Duration(cfg.Site.WatchdogTimeoutS) * time.Second
+			if watchdogTimeout <= 0 { watchdogTimeout = 60 * time.Second }
+			for _, tr := range tel.WatchdogScan(watchdogTimeout) {
+				if !tr.Online {
+					slog.Warn("driver telemetry stale — marking offline + reverting to autonomous",
+						"name", tr.Name, "timeout", watchdogTimeout)
+					_ = reg.SendDefault(ctx, tr.Name)
+				} else {
+					slog.Info("driver telemetry recovered — back online", "name", tr.Name)
+				}
+			}
+
+			// ---- Safety: site meter stale → idle everything this cycle ----
+			// Otherwise stale grid readings cause one battery to charge another.
+			ctrlMu.Lock()
+			siteMeterStale := tel.IsStale(ctrl.SiteMeterDriver, telemetry.DerMeter, watchdogTimeout)
+			ctrlMu.Unlock()
+			if siteMeterStale {
+				slog.Warn("site meter telemetry stale — idling batteries this cycle",
+					"driver", ctrl.SiteMeterDriver)
+				for _, n := range reg.Names() {
+					_ = reg.SendDefault(ctx, n)
+				}
+				continue
+			}
+
 			// ---- Compute dispatch ----
 			capMu.RLock()
 			capsSnap := make(map[string]float64, len(capacities))
