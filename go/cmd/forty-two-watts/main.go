@@ -25,6 +25,7 @@ import (
 	"github.com/frahlg/forty-two-watts/go/internal/configreload"
 	"github.com/frahlg/forty-two-watts/go/internal/control"
 	"github.com/frahlg/forty-two-watts/go/internal/drivers"
+	"github.com/frahlg/forty-two-watts/go/internal/ha"
 	mqttcli "github.com/frahlg/forty-two-watts/go/internal/mqtt"
 	modbuscli "github.com/frahlg/forty-two-watts/go/internal/modbus"
 	"github.com/frahlg/forty-two-watts/go/internal/selftune"
@@ -193,6 +194,49 @@ func main() {
 		defer c()
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
+
+	// ---- HA MQTT bridge (optional) ----
+	var haBridge *ha.Bridge
+	if cfg.HomeAssistant != nil && cfg.HomeAssistant.Enabled {
+		cb := ha.CommandCallbacks{
+			SetMode: func(m string) error {
+				ctrlMu.Lock()
+				defer ctrlMu.Unlock()
+				switch control.Mode(m) {
+				case control.ModeIdle, control.ModeSelfConsumption, control.ModePeakShaving,
+					control.ModeCharge, control.ModePriority, control.ModeWeighted:
+					ctrl.Mode = control.Mode(m)
+					return st.SaveConfig("mode", m)
+				}
+				return fmt.Errorf("unknown mode: %s", m)
+			},
+			SetGridTarget: func(w float64) error {
+				ctrlMu.Lock()
+				defer ctrlMu.Unlock()
+				ctrl.SetGridTarget(w)
+				return st.SaveConfig("grid_target_w", strconv.FormatFloat(w, 'f', 1, 64))
+			},
+			SetPeakLimit: func(w float64) error {
+				ctrlMu.Lock()
+				defer ctrlMu.Unlock()
+				ctrl.PeakLimitW = w
+				return nil
+			},
+			SetEVCharging: func(w float64, active bool) error {
+				ctrlMu.Lock()
+				defer ctrlMu.Unlock()
+				if active { ctrl.EVChargingW = w } else { ctrl.EVChargingW = 0 }
+				return nil
+			},
+		}
+		bridge, err := ha.Start(cfg.HomeAssistant, tel, ctrl, ctrlMu, reg.Names(), cb)
+		if err != nil {
+			slog.Warn("HA MQTT bridge failed to start", "err", err)
+		} else {
+			haBridge = bridge
+			defer haBridge.Stop()
+		}
+	}
 
 	// ---- Control loop ----
 	controlInterval := time.Duration(cfg.Site.ControlIntervalS) * time.Second

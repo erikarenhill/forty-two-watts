@@ -1,66 +1,59 @@
+# forty-two-watts config example (Go + WASM port)
+# Copy to config.yaml and edit for your site.
+
 site:
   name: "Home"
   control_interval_s: 5
   grid_target_w: 0              # 0 = self-consumption
-  grid_tolerance_w: 50          # deadband: don't adjust if within +/- W
-  watchdog_timeout_s: 60        # revert to autonomous if driver stalls
-  smoothing_alpha: 0.3          # EMA alpha (0-1, lower = smoother)
+  grid_tolerance_w: 42          # deadband (The Answer)
+  watchdog_timeout_s: 60
+  smoothing_alpha: 0.3
+  slew_rate_w: 500
+  min_dispatch_interval_s: 5
 
 fuse:
   max_amps: 16
   phases: 3
   voltage: 230
 
+# ----------------------------------------------------------------------
+# Drivers — WASM modules with per-driver capabilities.
+# Capabilities are the ONLY way the sandbox talks to the outside world.
+# A driver with only mqtt capability can't touch modbus, and vice versa.
+# ----------------------------------------------------------------------
 drivers:
   - name: ferroamp
-    lua: drivers/ferroamp.lua
-    is_site_meter: true          # this driver's meter is the grid connection point
+    wasm: drivers-wasm/ferroamp.wasm
+    is_site_meter: true              # exactly one driver must have this
     battery_capacity_wh: 15200
-    mqtt:
-      host: 192.168.1.153
-      port: 1883
-      username: extapi
-      password: ferroampExtApi
+    capabilities:
+      mqtt:
+        host: 192.168.1.153
+        port: 1883
+        username: extapi
+        password: ferroampExtApi
 
   - name: sungrow
-    lua: drivers/sungrow.lua
+    wasm: drivers-wasm/sungrow.wasm
     battery_capacity_wh: 9600
-    modbus:
-      host: 192.168.1.10
-      port: 502
-      unit_id: 1
+    capabilities:
+      modbus:
+        host: 192.168.1.10
+        port: 502
+        unit_id: 1
 
 api:
   port: 8080
 
+# Home Assistant MQTT bridge (optional)
 homeassistant:
-  enabled: true
-  broker: 192.168.1.1            # HA Mosquitto broker
+  enabled: false
+  broker: 192.168.1.1
   port: 1883
   username: homeems
   password: homeems
   publish_interval_s: 5
 
+# Persistent state (SQLite)
 state:
-  path: state.redb
-
-# Spot price (optional). elprisetjustnu.se is free, Sweden-only.
-# ENTSO-E covers all EU but needs a free api_key.
-price:
-  provider: elprisetjustnu       # or "entsoe" or "none"
-  zone: SE3                      # SE1, SE2, SE3, SE4
-  grid_tariff_ore_kwh: 0
-  vat_percent: 25
-
-# Weather forecast (optional). met.no is free, no key needed.
-weather:
-  provider: met_no               # or "openweather" or "none"
-  latitude: 59.3293              # default: Stockholm
-  longitude: 18.0686
-
-# Per-battery overrides (optional). Keys must match drivers[].name.
-# Leave blank to use BMS defaults.
-batteries: {}
-#  ferroamp:
-#    soc_min: 0.10
-#    weight: 2.0
+  path: state.db
