@@ -53,7 +53,7 @@
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     const cssW = canvas.clientWidth || 800;
-    const cssH = 260;
+    const cssH = 320;
     const dpr = window.devicePixelRatio || 1;
     canvas.width = cssW * dpr;
     canvas.height = cssH * dpr;

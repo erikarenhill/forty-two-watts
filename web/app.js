@@ -288,7 +288,7 @@
     var ctx = canvas.getContext("2d");
     var dpr = window.devicePixelRatio || 1;
     var w = canvas.parentElement.clientWidth - 32;
-    var h = 250;
+    var h = 300;
     if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
       canvas.width = w * dpr;
       canvas.height = h * dpr;
@@ -478,21 +478,32 @@
     });
 
     // ---- Forward-looking forecast (dashed PV + load from the plan) ----
-    // Drawn AFTER the actual series so dashes sit on top. Uses the 15-min
-    // plan slots as a step-wise curve extending from "now" to the right
-    // edge of the chart. Only rendered in power view.
+    // Anchor the forecast line at the CURRENT actual measurement so
+    // there's no jump at the "now" boundary. Then linear-interpolate
+    // through each upcoming 15-min slot (plotted at slot midpoint).
+    // Gives a smooth continuous line rather than a step function.
     if (chartView === "power" && chartPlan && chartPlan.actions) {
-      var drawForecast = function (field, color) {
+      var lastIdx = chartHistory.timestamps.length - 1;
+      var lastActualPV = lastIdx >= 0 ? chartHistory.pv[lastIdx] : null;
+      var lastActualLoad = lastIdx >= 0 ? chartHistory.load[lastIdx] : null;
+
+      var drawForecast = function (field, color, lastActual) {
         var pts = [];
+        // Anchor at "now" with the latest actual — avoids a visual jump
+        // between measured and predicted.
+        if (lastActual != null) {
+          pts.push({ x: tsToX(now), y: valToY(lastActual) });
+        }
         for (var i = 0; i < chartPlan.actions.length; i++) {
           var a = chartPlan.actions[i];
           var aEnd = a.slot_start_ms + a.slot_len_min * 60000;
-          if (aEnd < now) continue; // past slot
+          if (aEnd < now) continue;
           if (a.slot_start_ms > windowEnd) break;
-          var sStart = Math.max(a.slot_start_ms, now);
-          var sEnd = Math.min(aEnd, windowEnd);
-          pts.push({ x: tsToX(sStart), y: valToY(a[field]) });
-          pts.push({ x: tsToX(sEnd),   y: valToY(a[field]) });
+          // Plot at slot midpoint, so each forecast value sits where it
+          // actually represents the slot's expected average.
+          var midMs = (a.slot_start_ms + aEnd) / 2;
+          if (midMs < now) midMs = (now + aEnd) / 2; // first slot, half-consumed
+          pts.push({ x: tsToX(midMs), y: valToY(a[field]) });
         }
         if (pts.length < 2) return;
         ctx.strokeStyle = color;
@@ -505,8 +516,8 @@
         ctx.stroke();
         ctx.setLineDash([]);
       };
-      drawForecast("pv_w",   "#86efac"); // pale green
-      drawForecast("load_w", "#fde68a"); // pale yellow
+      drawForecast("pv_w",   "#86efac", lastActualPV);
+      drawForecast("load_w", "#fde68a", lastActualLoad);
     }
 
     // ---- Now-line separator (between past actuals and future forecast) ----
