@@ -1,3 +1,9 @@
+## [1.0.1](https://github.com/erikarenhill/forty-two-watts/compare/v1.0.0...v1.0.1) (2026-04-15)
+
+### Bug Fixes
+
+* **ci:** disable @semantic-release/github PR annotation features ([51eb9e2](https://github.com/erikarenhill/forty-two-watts/commit/51eb9e240c2cac3468169c774a32116600f6b349)), closes [#32](https://github.com/erikarenhill/forty-two-watts/issues/32) [#33](https://github.com/erikarenhill/forty-two-watts/issues/33) [#34](https://github.com/erikarenhill/forty-two-watts/issues/34) [#35](https://github.com/erikarenhill/forty-two-watts/issues/35) [#36](https://github.com/erikarenhill/forty-two-watts/issues/36) [#39](https://github.com/erikarenhill/forty-two-watts/issues/39)
+
 ## 1.0.0 (2026-04-15)
 
 ### Bug Fixes
