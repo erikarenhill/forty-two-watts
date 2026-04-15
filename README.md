@@ -155,6 +155,10 @@ build step.
   — hands-on recipe for using Claude Code to bootstrap a driver from
   a vendor register map: prompts, porting checklist, common mistakes,
   iteration loop.
+- [`docs/testing-drivers-live.md`](docs/testing-drivers-live.md) —
+  runbook for iterating against the bundled simulators and against
+  real hardware on a Raspberry Pi, with verified `curl` + `make`
+  commands for every common loop.
 - `drivers/sungrow.lua` — full Modbus TCP reference implementation.
 - `drivers/ferroamp.lua` — full MQTT reference implementation.
 
