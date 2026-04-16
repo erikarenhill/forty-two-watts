@@ -282,27 +282,23 @@
     ctx.textAlign = 'left';
     ctx.fillText('Power', pad.l + 4, powerY0 + 12);
 
-    // ---- Mode band — colored strip showing which EMS mode is scheduled ----
-    const MODE_COLORS = {
-      self_consumption: 'rgba(34,197,94,0.45)',   // green
-      charge:           'rgba(245,158,11,0.55)',   // amber
-      peak_shaving:     'rgba(139,92,246,0.45)',   // purple
-      idle:             'rgba(100,116,139,0.30)',   // slate
-    };
+    // ---- Battery action band — colored strip showing charge/discharge/idle per slot ----
     if (plan && plan.actions) {
       for (const a of plan.actions) {
         if (a.slot_start_ms > tMax) break;
-        const mode = a.ems_mode || 'self_consumption';
-        const color = MODE_COLORS[mode] || MODE_COLORS.self_consumption;
         const x0 = xScale(a.slot_start_ms);
         const x1 = xScale(a.slot_start_ms + a.slot_len_min * 60 * 1000);
+        let color;
+        if (a.battery_w > 100)       color = 'rgba(245,158,11,0.6)';   // amber = charging
+        else if (a.battery_w < -100) color = 'rgba(139,92,246,0.6)';   // purple = discharging
+        else                         color = 'rgba(100,116,139,0.2)';  // slate = idle
         ctx.fillStyle = color;
         ctx.fillRect(x0, modeBandY0, Math.max(1, x1 - x0 - 1), modeBandH);
       }
       ctx.fillStyle = 'rgba(255,255,255,0.45)';
       ctx.font = '9px system-ui, sans-serif';
       ctx.textAlign = 'left';
-      ctx.fillText('Mode', pad.l + 4, modeBandY0 + modeBandH - 2);
+      ctx.fillText('Battery', pad.l + 4, modeBandY0 + modeBandH - 2);
     }
 
     // ---- Plan battery bars ----
@@ -417,9 +413,12 @@
         lines.push(`<div class="tip-row"><span>Grid</span><b>${(Math.abs(a.grid_w) / 1000).toFixed(1)} kW ${gdir}</b></div>`);
       }
       if (a.soc_pct != null) lines.push(`<div class="tip-row"><span>SoC (end)</span><b>${a.soc_pct.toFixed(0)}%</b></div>`);
-      if (a.ems_mode) {
-        const modeLabel = { self_consumption: 'Self-consumption', charge: 'Charge', peak_shaving: 'Peak shaving', idle: 'Idle' }[a.ems_mode] || a.ems_mode;
-        lines.push(`<div class="tip-row"><span>Mode</span><b>${modeLabel}</b></div>`);
+      if (a.battery_w != null) {
+        let action;
+        if (a.battery_w > 100) action = 'Charging';
+        else if (a.battery_w < -100) action = 'Discharging';
+        else action = 'Idle';
+        lines.push(`<div class="tip-row"><span>Plan</span><b>${action}</b></div>`);
       }
       if (a.reason) lines.push(`<div class="tip-reason">${a.reason}</div>`);
       tip.innerHTML = lines.join('');
