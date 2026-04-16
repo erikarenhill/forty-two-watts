@@ -422,6 +422,13 @@ func (s *Service) replan(_ context.Context) *Plan {
 
 	plan := Optimize(slots, p)
 
+	// Tag each action with the effective EMS mode so the UI can render
+	// a mode-band showing which strategy drives each slot.
+	for i := range plan.Actions {
+		mode, _, _ := actionToSlot(plan.Actions[i], p.Mode)
+		plan.Actions[i].EMSMode = mode
+	}
+
 	s.mu.Lock()
 	s.last = &plan
 	s.lastReplanAt = time.Now()
