@@ -165,6 +165,30 @@ also short-circuits the dispatch cycle when the configured site-meter
 driver is stale, because a stale grid reading causes one battery to
 charge another.
 
+## Git workflow
+
+- **Always work on a feature branch** — never commit directly to
+  `master`. Branch names: `feat/<topic>`, `fix/<topic>`, `ci/<topic>`,
+  `docs/<topic>`, etc.
+- **Conventional commit messages** — this repo uses semantic-release
+  to auto-version and publish Docker images. Every commit message MUST
+  follow the [Conventional Commits](https://www.conventionalcommits.org/)
+  format: `type(scope): description`. The scope is optional but
+  encouraged — use the package, driver, or subsystem name, e.g.
+  `fix(dashboard): double-v prefix in version display`,
+  `feat(pixii): add active-power setpoint demand response`,
+  `fix(solaredge_pv): read SunSpec scale factors every poll`.
+  The type determines the version bump:
+  - `feat` / `drivers` / `driver` / `ui` / `support` → **minor**
+  - `fix` / `perf` / `revert` / `refactor` / `control` / `mpc` /
+    `telemetry` / `tsdb` / `safety` → **patch**
+  - `docs` / `test` / `style` / `chore` / `build` / `ci` → **no release**
+  - `BREAKING CHANGE:` footer or `!` after the type → **major**
+  See `.releaserc.json` for the full rule set.
+- Push the feature branch to `origin`, open a PR against `master`.
+  Merging the PR triggers the release workflow (semantic-release →
+  Docker build → GHCR push).
+
 ## Code conventions
 
 - `slog` for all logging
